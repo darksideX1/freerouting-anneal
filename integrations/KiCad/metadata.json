@@ -135,10 +135,10 @@
       "version": "1.1.1",
       "status": "stable",
       "kicad_version": "6.0",
-      "download_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "download_size": 0,
+      "download_sha256": "f81cf870c1d25ec2b10885e7e70f8691ac44123077894ab0ca82e7b836a9fbaa",
+      "download_size": 58373895,
       "download_url": "https://github.com/darksideX1/freerouting-anneal/releases/download/v1.1.1/kicad-freerouting-1.1.1.zip",
-      "install_size": 0
+      "install_size": 63202754
     }
   ]
 }
