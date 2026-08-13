@@ -92,6 +92,48 @@ jobs:
           release-tag: v${{ steps.tagName.outputs.tag }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+  build-kicad-plugin:
+    needs: build-and-test
+    runs-on: [ ubuntu-latest ]
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+          cache: 'gradle'
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+      # Stages the current jar into the plugin and zips it. The jar is deliberately NOT
+      # committed -- a jar in the tree makes the tree dirty, so the jar inside it reports
+      # a build nobody can reproduce. That means the release is the ONLY thing that
+      # produces this archive, and metadata.json points at the asset uploaded below.
+      - name: Build the KiCad plugin archive
+        run: ./gradlew kicadPlugin
+      # The archive embeds a jar stamped with its build date and commit, so it is never
+      # byte-identical to one built anywhere else. A checksum committed in the tree would
+      # therefore always describe a different file than the one users download, and KiCad
+      # rejects an archive whose hash or size does not match its manifest. The committed
+      # values are zero placeholders; the real ones are computed here, from the artifact
+      # that is actually being uploaded.
+      - name: Fill the KiCad manifest from the built archive
+        run: python3 scripts/build/kicad-manifest-checksums.py
+      - name: Get Tag name
+        uses: olegtarasov/get-tag@v2.1
+        id: tagName
+        with:
+          tagRegex: "v(.*)"
+          tagRegexGroup: 1
+      - uses: AButler/upload-release-assets@v3.0
+        with:
+          files: './build/dist/kicad-freerouting-${{ steps.tagName.outputs.tag }}.zip;./build/dist/metadata.json'
+          release-tag: v${{ steps.tagName.outputs.tag }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
   build-windows-x64:
     needs: build-and-test
     runs-on: [ windows-latest ]

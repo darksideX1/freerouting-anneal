@@ -5,6 +5,7 @@ import app.freerouting.api.mcp.McpApplication;
 import app.freerouting.api.mcp.McpContextListener;
 import app.freerouting.api.mcp.McpWebSocketEndpoint;
 import app.freerouting.constants.Constants;
+import app.freerouting.core.CliOutcome;
 import app.freerouting.core.RoutingJob;
 import app.freerouting.core.RoutingJobState;
 import app.freerouting.drc.DesignRulesChecker;
@@ -61,20 +62,369 @@ import org.glassfish.jersey.servlet.ServletContainer;
 public class Freerouting {
 
   public static final String WEB_URL = "https://www.freerouting.app";
-  public static final String VERSION_NUMBER_STRING = "v" + Constants.FREEROUTING_VERSION + " (build-date: "
-      + Constants.FREEROUTING_BUILD_DATE + ")";
+  public static final String VERSION_NUMBER_STRING = formatVersionBanner(
+      Constants.FREEROUTING_VERSION, Constants.FREEROUTING_SOURCE_BUILD,
+      Constants.FREEROUTING_BUILD_DATE);
+
+  /**
+   * The one line that identifies this build.
+   *
+   * <p>Every cut of this fork reports the same {@code v2.3.x-SNAPSHOT}, so the handout had
+   * to tell people to record a commit sha by hand and the changelog had to open with
+   * "identity is the commit, not a version string". Asking a human to carry information
+   * the program already has is a documentation workaround for a product defect: three
+   * byte-different jars were cut in one day, all claiming the same version, and given two
+   * of them nobody could say which was which.
+   *
+   * <p>A build from a modified tree carries {@code -dirty}. It is not the commit it names
+   * -- nobody can reproduce it from that sha -- and a build claiming an identity it cannot
+   * support is worse than one that admits it has none.
+   *
+   * <p>With no lane id (no git, e.g. a source tarball) the banner is byte-for-byte what
+   * upstream always printed, so this costs an upstream user nothing.
+   */
+  static String formatVersionBanner(String version, String sourceBuild, String buildDate) {
+    String build = (sourceBuild == null) ? "" : sourceBuild.trim();
+    String buildSuffix = build.isEmpty() ? "" : ("build " + build + ", ");
+    return "v" + version + " (" + buildSuffix + "build-date: " + buildDate + ")";
+  }
   public static GlobalSettings globalSettings;
   public static String bridgeToken = java.util.UUID.randomUUID().toString();
   private static Server apiServer; // API server instance
   private static Server mcpServer; // MCP server instance
   private static java.io.PrintStream originalSystemOut;
 
-  private static boolean InitializeCLI(GlobalSettings globalSettings) {
+  /** How often the headless CLI checks whether the job has finished. */
+  private static final long CLI_POLL_INTERVAL_MS = 500;
+
+  /**
+   * The extended manual, printed by --helpful.
+   *
+   * <p>--help lists flags, which tells you what you may type and nothing about what to do.
+   * This is the part a first-time user actually needs: how long to give it, what the endings
+   * mean, and how to stop it without losing the board.
+   */
+  /**
+   * The optimiser flag surface, appended to --help after the localized text. English on
+   * purpose: it changes with the code, and a stale translation of a default is worse
+   * than an untranslated truth. (The localized -mt text shipped "cores minus one" for a
+   * release whose headline was the measured width-2 default.)
+   */
+  private static final String OPTIMIZER_HELP_TEXT = """
+
+      OPTIMIZER FLAGS (the full list: docs/command_line_arguments.md)
+
+        --router.optimizer.max_threads=N    optimiser width. DEFAULT 2 (measured quality
+                                            point). 1 = single-threaded. Core count is a
+                                            ceiling, never a target.
+        --router.optimizer.rounds=N         fixed items per pass; switches the automatic
+                                            work-window guard OFF.
+        --router.optimizer.memory_budget_mb=N  clone-memory cap; width shrinks to fit,
+                                            loudly.
+        --router.optimizer.board_update_strategy=greedy|global_optimal|hybrid
+        --router.optimizer.item_selection_strategy=prioritized|most_to_gain|sequential|random
+        --router.optimizer.enabled=false    routing only.
+
+      Routing itself is single-threaded. -mt / --router.max_threads is the RACING width
+      (redundant parallel routing attempts, keep the best) and only acts together with
+      --router.racing_enabled=true. It does not affect the optimiser.
+      """;
+
+  private static final String HELPFUL_TEXT = """
+      FREEROUTING - how to get a good board
+
+      THE SHORT VERSION
+        freerouting -de board.dsn -do board.ses
+      Fifteen minutes by default. Most boards finish well inside it.
+
+      WHAT IT DOES, IN ORDER
+        1. Fanout      escapes pins out of fine-pitch packages so routing has pads to reach
+        2. Auto-route  connects the nets
+        3. Optimise    rips up and re-routes individual items, keeping only improvements
+
+      Each stage stops inside the job's time budget, finishing the pass it is in so the board
+      handed on is whole rather than half-applied.
+
+      WHICH STAGES ARE MULTI-THREADED
+        Fanout      single-threaded.
+        Routing     single-threaded. The only multi-core routing mode is RACING: redundant
+                    identical attempts (same settings, different item orderings), best one
+                    wins. Opt-in: --router.racing_enabled=true with --router.max_threads=N.
+                    Two correctness defects were fixed (deterministic per-thread
+                    ordering seeds; memory-bounded copies); it was NOT algorithmically
+                    tuned, and measured it returns the same or a worse board than one
+                    attempt. An option, not a recommendation.
+        Optimising  MULTI-THREADED BY DEFAULT, two threads. This is the stage this release
+                    fixed, measured, and governs. Width 1 = single-threaded.
+
+      STAGE: FANOUT - escapes fine-pitch pads; single-threaded
+        On by default; --router.fanout.enabled=false skips it for boards without
+        fine-pitch packages. It shares the one job budget like every stage.
+
+      STAGE: ROUTING - the found optimum is the defaults
+        The defaults are the measured optimum; there is nothing to raise here for speed.
+        What you CAN change is the objective it routes toward:
+        --router.scoring.via_costs=100    the via-lean profile: fewer vias per connection
+                                          at every width, about one completed connection
+                                          fewer on dense boards. Applies end to end.
+
+      STAGE: OPTIMISING - the found optimum is the default; the trade is yours
+        Default: 2 threads, greedy updates, prioritized selection, automatic work-window
+        guard. That combination won the measurements; the others below are real options,
+        not recommendations:
+        --router.optimizer.max_threads=4  balanced: faster, best length, a few vias more
+        --router.optimizer.max_threads=6  the speed setting; beyond 8 is strictly worse
+        --router.optimizer.max_threads=1  single-threaded, the 1.0.3 behaviour
+        --router.optimizer.rounds=400     fixed work instead of the guard (same quality,
+                                          measured; you pay for work past convergence)
+        --router.optimizer.enabled=false  routing only: 2-3x faster overall where
+                                          routing is quick, no help where it is not
+        Core count is a ceiling, never a target - asking for more than the machine has is
+        clamped, and the run says so.
+
+      HOW LONG TO GIVE IT
+        --router.job_timeout=00:15:00     default
+        --router.job_timeout=01:00:00     a board that reported running out of time
+
+      Time is normally spent almost entirely in the optimiser - routing is usually seconds.
+      DIFFICULT BOARDS are the exception, and net count does NOT predict them: we measured
+      a 111-net board that routes in under a second and a 95-net board that runs for an
+      hour. The reliable signal is the run itself: if routing pass #1 is still going at
+      minute five, this is an hours-board - stop it, set a budget in hours, and let it run.
+      The board is saved at the wall either way.
+
+      READ THE LAST LINE. IT TELLS YOU WHAT TO DO NEXT.
+        "Pass finished. No further improvements found."
+            As good as this board gets. A longer timeout changes nothing. Do not re-run.
+        "Ran out of time."
+            Still improving when the clock stopped it. Re-run with a longer job_timeout.
+        "Stopped on request."
+            You ended it. Whatever it had is written.
+
+      WHEN IT FINISHES: THE REPORT AND THE LOG
+      Every run that is not cancelled writes a report next to the log, named for the board
+      and the time, and prints its path as its LAST line (the graphical interface offers
+      to open it). It states how the run ended, how long it took, how many connections
+      were routed of how many, the violation count, and - if anything is unfinished -
+      every unrouted connection by net, naming both ends:
+          Net 'GND' (1 unrouted connection):
+              - J2-A3  ->  U1-4
+      That list is the point: a board with a handful of gaps can be finished by hand from
+      it, pad to pad. Two runs of the same board leave two reports, so attempts compare.
+
+      The log is on by default and lives beside the reports, under your user directory:
+        Windows  %APPDATA%\\freerouting\\logs\\
+        Linux    ~/.local/share/freerouting/logs/
+        macOS    ~/Library/Application Support/freerouting/logs/
+      The FIRST line of every run prints the full path, and the graphical interface shows
+      it in the status bar while a run is going.
+
+      STOPPING A RUN WITHOUT LOSING IT
+        CLI, while running:  s = stop and keep the board    c = cancel, no output
+        GUI:                 the Stop button
+        Signals:             SIGTERM and Ctrl-C save the board before exiting
+
+      Closing a console window on Windows may not leave us time to save - Windows terminates
+      the process on its own schedule. Press Stop first if the run matters.
+
+      IF THE BOARD COMES BACK UNFINISHED
+      Unrouted nets are not always the router giving up early. Raise the timeout once; if the
+      count does not move and it reports no further improvements, the board is telling you
+      something about placement rather than about the router.
+
+      MORE
+        --help    the flag reference; every setting: docs/command_line_arguments.md
+        docs/USER-GUIDE.md and docs/command_line_arguments.md in the source tree
+      """;
+
+  /**
+   * Hard ceiling on the wait, independent of the predicate.
+   *
+   * <p>Defence in depth: the job's own deadline is capped at 24 hours by the scheduler, so
+   * a wait exceeding 25 hours means the state machine failed to reach a terminal state,
+   * not that the board is slow. A loop whose only exit is a predicate someone else sets
+   * should not be the last line of defence against a hang -- which is exactly what this
+   * loop turned out to be.
+   */
+  private static final long CLI_MAX_WAIT_ITERATIONS =
+      (25L * 60L * 60L * 1000L) / CLI_POLL_INTERVAL_MS;
+
+  /**
+   * Whether the job has stopped, for any reason.
+   *
+   * <p>Every terminal state must answer true -- that is what terminal means. The previous
+   * inline test named two of the four, so a timed-out or cancelled job left the CLI
+   * spinning until the process was killed from outside.
+   */
+  static boolean isJobFinished(RoutingJobState state) {
+    return state.isTerminal();
+  }
+
+  /**
+   * Whether the job left a board worth writing to the user's output file.
+   *
+   * <p>A separate question from {@link #isJobFinished}. A deadline stop is a deliberate,
+   * well-formed outcome -- the user asked for a time-boxed run and the partial board IS
+   * the thing they asked for, so refusing to write it makes the option useless. A job that
+   * was cancelled or that died on an error left nothing worth overwriting a file with.
+   */
+  /** True once the run has told the user which keys end it, so it is said once. */
+  private static boolean stopKeysAnnounced = false;
+
+  /**
+   * Ends the run if the user pressed s or c.
+   *
+   * <p>Only when a console is attached. A piped or redirected run -- CI, a script, nohup --
+   * has no interactive user and must behave exactly as it did before; reading a key there
+   * would at best do nothing and at worst block a headless run forever.
+   *
+   * <p>Non-blocking by construction: it reads only what is already buffered, so a run with a
+   * console but nobody watching it is not slowed down.
+   */
+  static void pollForStopKey(RoutingJob p_job) {
+    if (System.console() == null) {
+      return; // not interactive: leave the run exactly as it was
+    }
+    if (!stopKeysAnnounced) {
+      stopKeysAnnounced = true;
+      FRLogger.info("  Stop [s] - end now, keep board   Cancel [c] - end now, no output");
+    }
+    try {
+      while (System.in.available() > 0) {
+        int key = System.in.read();
+        if (key == 's' || key == 'S') {
+          FRLogger.info("Stopping. Current pass will finish; board will be written.");
+          p_job.stoppedByUser = true;
+          p_job.thread.requestStop();
+          return;
+        }
+        if (key == 'c' || key == 'C') {
+          FRLogger.info("Cancelling. No output file will be written.");
+          p_job.thread.requestStop();
+          p_job.state = RoutingJobState.CANCELLED;
+          return;
+        }
+      }
+    } catch (java.io.IOException e) {
+      // A console that cannot be read is not a reason to abandon a route that is going fine.
+      FRLogger.warn("Could not read the keyboard; the run continues. " + e.getMessage());
+    }
+  }
+
+  static boolean shouldWriteCliOutput(RoutingJobState state) {
+    return state.hasUsableOutput();
+  }
+
+  /**
+   * Writes the routed board to the path the CLI was given.
+   *
+   * <p>Extracted so the shutdown hook and the normal flow save through the same code. A second
+   * writer for the interrupted case would be a second thing to keep correct, and the one that
+   * runs rarely is the one that rots.
+   */
+  static void writeCliOutput(RoutingJob p_job) throws IOException {
+    Path outputFilePath = Path.of(globalSettings.initialOutputFile);
+    Files.write(outputFilePath, p_job.output.getData().readAllBytes());
+  }
+
+  /**
+   * Classifies a finished job so the caller can act on it without reading the log.
+   *
+   * <p>When the board cannot be measured the answer is INCOMPLETE, never COMPLETE:
+   * "I could not tell" and "it is clean" must not collapse into the same signal, and of
+   * the two possible errors, sending someone to check a board that was fine is far
+   * cheaper than telling them a board is fine when nobody knows.
+   */
+  /**
+   * Tells the user which ending they got, because the two look identical and mean opposite
+   * things.
+   *
+   * <p>An unfinished board after the optimiser gave up is finished work: it stopped because
+   * it stopped finding improvements, and a longer budget buys nothing. An unfinished board
+   * after the clock ran out is interrupted work: it was still improving when it was cut, and
+   * more time may help. Without this line a user looking at unrouted nets has no way to tell
+   * whether to raise the timeout or stop trying -- which is the only decision they have.
+   */
+  static void reportHowTheRunEnded(RoutingJob p_job) {
+    String message = endingMessage(p_job);
+    if (message != null) {
+      FRLogger.info(message);
+    }
+  }
+
+  /**
+   * Which ending this run got, as text, or null when there is nothing to say.
+   *
+   * <p>Separated from the logging so it can be pinned by a test. These strings have been
+   * wrong more than once -- they are read as a decision about whether to re-run, so a
+   * confident sentence describing the wrong ending is worse than no sentence.
+   */
+  public static String endingMessage(RoutingJob p_job) {
+    if (p_job.stageTimedOut || p_job.state == RoutingJobState.TIMED_OUT) {
+      return "Ran out of time. Routing was still in progress when the budget expired."
+          + " A longer --router.job_timeout may produce a better board.";
+    }
+    if (p_job.stoppedByUser) {
+      return "Stopped on request. Board written as routed at that point.";
+    }
+    if (p_job.state == RoutingJobState.CANCELLED) {
+      // Cancel is not stop. hasUsableOutput() is COMPLETED || TIMED_OUT, so a cancelled run
+      // writes nothing at all -- sharing the stop wording sent users looking for a file that
+      // was never created.
+      return "Cancelled on request. No output file was written.";
+    }
+    if (p_job.state == RoutingJobState.COMPLETED) {
+      return "Pass finished. No further improvements found."
+          + " A longer --router.job_timeout will not change this result.";
+    }
+    return null;
+  }
+
+  private static CliOutcome outcomeFor(RoutingJob job) {
+    if (job.state == RoutingJobState.TERMINATED || job.board == null) {
+      return CliOutcome.FAILED;
+    }
+    boolean stoppedEarly = (job.state == RoutingJobState.TIMED_OUT)
+        || (job.state == RoutingJobState.CANCELLED);
+    try {
+      var stats = new app.freerouting.core.scoring.BoardStatistics(job.board);
+      return CliOutcome.of(stats.connections.incompleteCount,
+          stats.clearanceViolations.totalCount, stoppedEarly);
+    } catch (Exception e) {
+      FRLogger.warn("Could not measure the final board to classify the run outcome; "
+          + "reporting it as incomplete rather than claiming a clean board. "
+          + e.getMessage());
+      return stoppedEarly ? CliOutcome.STOPPED_EARLY : CliOutcome.INCOMPLETE;
+    }
+  }
+
+  /**
+   * Reports a failure to read the input file.
+   *
+   * <p>A file that is not there is the user's typo, not our defect, and answering it with
+   * a Java stack trace tells them nothing they can act on while implying the program
+   * broke. Stack traces are for OUR bugs. An expected, explainable condition gets a
+   * sentence naming the path and what to check.
+   */
+  private static void logInputFileFailure(String path, Exception e) {
+    if ((e instanceof java.io.FileNotFoundException)
+        || (e instanceof java.nio.file.NoSuchFileException)) {
+      FRLogger.error("Input file not found: '" + path + "'. Check the path is correct and"
+          + " that you are running from the directory you think you are.", null);
+    } else if (e instanceof java.nio.file.AccessDeniedException) {
+      FRLogger.error("Input file '" + path + "' cannot be read: permission denied.", null);
+    } else {
+      // Anything else is unexplained, and there the stack trace is the useful part.
+      FRLogger.error("Couldn't load the input file '" + path + "': " + e.getMessage(), e);
+    }
+  }
+
+  private static CliOutcome InitializeCLI(GlobalSettings globalSettings) {
     if ((globalSettings.initialInputFile == null) || (globalSettings.initialOutputFile == null)) {
       FRLogger.error(
           "Both an input file and an output file must be specified with command line arguments if you are running in CLI mode.",
           null);
-      return false;
+      return CliOutcome.FAILED;
     }
 
     // Start a new Freerouting session
@@ -85,6 +435,24 @@ public class Freerouting {
 
     // Create a new routing job
     RoutingJob routingJob = new RoutingJob(cliSession.id);
+    // So an external stop can ask this job to save instead of killing it: the CLI does not
+    // go through RoutingJobScheduler, so the hook cannot find it any other way.
+    app.freerouting.management.GracefulShutdown.register(routingJob, () -> {
+      // Runs only if the job actually reached a final state; the hook checks that. Guarded
+      // again here because a board written from a job with nothing usable would be a file
+      // that looks like a result and is not.
+      if (!shouldWriteCliOutput(routingJob.state)) {
+        return;
+      }
+      try {
+        writeCliOutput(routingJob);
+        FRLogger.info("Wrote the board to '" + globalSettings.initialOutputFile
+            + "' after being asked to stop.");
+      } catch (IOException e) {
+        FRLogger.error("Could not write the board to '" + globalSettings.initialOutputFile
+            + "' after being asked to stop; the routing work is lost.", e);
+      }
+    });
 
     // Load the input file
     DsnFileSettings inputFileSettings = null;
@@ -92,12 +460,12 @@ public class Freerouting {
       routingJob.setInput(globalSettings.initialInputFile);
       inputFileSettings = new DsnFileSettings(routingJob.input.getData(), routingJob.input.getFilename());
     } catch (Exception e) {
-      FRLogger.error("Couldn't load the input file '" + globalSettings.initialInputFile + "'", e);
+      logInputFileFailure(globalSettings.initialInputFile, e);
     }
 
     if (routingJob.input == null) {
       FRLogger.warn("Couldn't read the input file '" + globalSettings.initialInputFile + "', aborting.");
-      return false;
+      return CliOutcome.FAILED;
     }
 
     cliSession.addJob(routingJob);
@@ -120,45 +488,83 @@ public class Freerouting {
     routingJob.state = RoutingJobState.READY_TO_START;
 
     // Wait for the RoutingJobScheduler to do its work
-    while ((routingJob.state != RoutingJobState.COMPLETED) && (routingJob.state != RoutingJobState.TERMINATED)) {
+    long waitedIterations = 0;
+    while (!isJobFinished(routingJob.state)) {
+      if (++waitedIterations > CLI_MAX_WAIT_ITERATIONS) {
+        // Never spin forever on a state someone else is responsible for setting.
+        FRLogger.error("The routing job did not reach a final state within 25 hours and is"
+            + " still reported as " + routingJob.state + ". Giving up waiting; no output"
+            + " file will be written. This is a defect in the job state machine, not a"
+            + " property of the board.", null);
+        break;
+      }
       try {
-        Thread.sleep(500);
+        Thread.sleep(CLI_POLL_INTERVAL_MS);
+        pollForStopKey(routingJob);
       } catch (InterruptedException _) {
         routingJob.state = RoutingJobState.CANCELLED;
         break;
       }
     }
 
+    reportHowTheRunEnded(routingJob);
+
+    // The final run report: counts and the per-pin unrouted list, in a file the user
+    // can keep (spec: docs/fork/FINAL-REPORT-SPEC.md). Cancelled runs write nothing.
+    java.nio.file.Path finalReportPath = app.freerouting.core.FinalRunReport.write(
+        routingJob, routingJob.board, endingMessage(routingJob));
+
     // Save the output file
-    if (routingJob.state == RoutingJobState.COMPLETED) {
+    boolean outputWriteFailed = false;
+    if (shouldWriteCliOutput(routingJob.state)) {
       try {
-        Path outputFilePath = Path.of(globalSettings.initialOutputFile);
-        Files.write(outputFilePath, routingJob.output
-            .getData()
-            .readAllBytes());
+        writeCliOutput(routingJob);
       } catch (IOException e) {
         FRLogger.error("Couldn't save the output file '" + globalSettings.initialOutputFile + "'", e);
+        // A run that routed for an hour and could not save it did not succeed, whatever
+        // the routing result was. This used to return success regardless (FS11).
+        outputWriteFailed = true;
       }
 
-      // Print a sponsor/success-story message to stdout (not the log) once the
-      // condition is met: ≥5 completed jobs and the user has not yet saved their email
-      if ((globalSettings.statistics.jobsCompleted >= 5)
-          && globalSettings.userProfileSettings.userEmail.isEmpty()) {
-        String nl = System.lineSeparator();
-        System.out.println(
-            nl
-            + "╔══════════════════════════════════════════════════════════════════╗" + nl
-            + "║           Thank you for using Freerouting!                       ║" + nl
-            + "║                                                                  ║" + nl
-            + "║  If you would like to support the project, please consider       ║" + nl
-            + "║  sponsoring me at https://github.com/sponsors/andrasfuchs        ║" + nl
-            + "║  Even a small monthly donation is greatly appreciated!           ║" + nl
-            + "╚══════════════════════════════════════════════════════════════════╝"
-        );
-      }
+      printSponsorMessageIfDue(globalSettings);
     }
 
-    return true;
+    // Last line by design: the user learns the report exists from the final thing the
+    // run prints (spec section 3).
+    if (finalReportPath != null) {
+      FRLogger.info("Run report: " + finalReportPath);
+    }
+
+    if (outputWriteFailed) {
+      return CliOutcome.FAILED;
+    }
+    return outcomeFor(routingJob);
+  }
+
+
+  /**
+   * Prints the sponsorship note to stdout, not the log, once a user has completed a
+   * few jobs without leaving contact details.
+   *
+   * <p>Lifted out of the routing entry point: soliciting sponsorship is not part of
+   * routing a board, and inlining it meant the method that loads, routes and saves a
+   * design also owned when to ask for money.
+   */
+  private static void printSponsorMessageIfDue(GlobalSettings globalSettings) {
+    if ((globalSettings.statistics.jobsCompleted >= 5)
+        && globalSettings.userProfileSettings.userEmail.isEmpty()) {
+      String nl = System.lineSeparator();
+      System.out.println(
+          nl
+          + "╔══════════════════════════════════════════════════════════════════╗" + nl
+          + "║           Thank you for using Freerouting!                       ║" + nl
+          + "║                                                                  ║" + nl
+          + "║  If you would like to support the project, please consider       ║" + nl
+          + "║  sponsoring me at https://github.com/sponsors/andrasfuchs        ║" + nl
+          + "║  Even a small monthly donation is greatly appreciated!           ║" + nl
+          + "╚══════════════════════════════════════════════════════════════════╝"
+      );
+    }
   }
 
   private static boolean InitializeDRC(GlobalSettings globalSettings) {
@@ -180,7 +586,7 @@ public class Freerouting {
       FRLogger.info("Loading DSN file for DRC: " + globalSettings.initialInputFile);
       drcJob.setInput(globalSettings.initialInputFile);
     } catch (Exception e) {
-      FRLogger.error("Couldn't load the input file '" + globalSettings.initialInputFile + "'", e);
+      logInputFileFailure(globalSettings.initialInputFile, e);
       System.exit(1);
     }
 
@@ -580,7 +986,10 @@ public class Freerouting {
 
   private static Path resolveLogPath(String input, Path defaultDir) {
     if (input == null || input.isBlank()) {
-      return defaultDir.resolve("freerouting.log").normalize().toAbsolutePath();
+      // logs/ subdirectory, not the user-data root: the root holds freerouting.json and
+      // the GUI state, and a rolling ring of log files next to the config is clutter
+      // that makes both harder to find.
+      return defaultDir.resolve("logs").resolve("freerouting.log").normalize().toAbsolutePath();
     }
 
     // In Windows the leading "." character means current directory
@@ -613,6 +1022,14 @@ public class Freerouting {
    * @param args
    */
   void main(String[] args) {
+    // Be a good citizen about being told to go away. SIGTERM, Ctrl-C, a container being
+    // reclaimed, the machine suspending or shutting down: all of them used to take the JVM
+    // down with the routed board still in memory and nothing written (defect 28). The job's
+    // own deadline was already graceful; every stop a USER can initiate was not, which is
+    // exactly backwards. Installed first so it covers the whole run, not just the part after
+    // the settings parse.
+    app.freerouting.management.GracefulShutdown.install();
+
     originalSystemOut = System.out;
     boolean isStdioMode = false;
     if (args.length > 0) {
@@ -640,15 +1057,18 @@ public class Freerouting {
 
     // the first thing we need to do is to determine the user directory, because all
     // settings and logs will be located there
-    // 1, set it to the temp directory by default
-    Path userdataPath = Path.of(System.getProperty("java.io.tmpdir"), "freerouting");
-    String userdataPathSource = "default (java.io.tmpdir)";
+    // 1, platform app-data by default -- config and logs must survive a reboot. The
+    // temp directory (the inherited default) is the documented last resort only.
+    Path userdataPath = app.freerouting.settings.GlobalSettings.defaultUserDataPath();
+    String userdataPathSource = "default (platform app-data)";
     // 2, check if we need to override it with the "FREEROUTING__USER_DATA_PATH"
     // environment variable value
-    if (System.getenv("FREEROUTING__USER_DATA_PATH") != null) {
+    if (System.getenv("FREEROUTING__USER_DATA_PATH") != null
+        && !System.getenv("FREEROUTING__USER_DATA_PATH").isBlank()) {
       userdataPath = Path.of(System.getenv("FREEROUTING__USER_DATA_PATH"));
       userdataPathSource = "environment variable FREEROUTING__USER_DATA_PATH";
-    } else if (System.getenv("FREEROUTING__LOGGING__FILE__LOCATION") != null) {
+    } else if (System.getenv("FREEROUTING__LOGGING__FILE__LOCATION") != null
+        && !System.getenv("FREEROUTING__LOGGING__FILE__LOCATION").isBlank()) {
       userdataPath = Path.of(System.getenv("FREEROUTING__LOGGING__FILE__LOCATION"));
       userdataPathSource = "environment variable FREEROUTING__LOGGING__FILE__LOCATION (deprecated fallback)";
     }
@@ -663,10 +1083,11 @@ public class Freerouting {
           .findFirst();
 
       if (userDataPathArg.isPresent()) {
-        userdataPath = Path.of(userDataPathArg
-            .get()
-            .substring("--user_data_path=".length()));
-        userdataPathSource = "CLI argument --user_data_path";
+        String argValue = userDataPathArg.get().substring("--user_data_path=".length());
+        if (!argValue.isBlank()) {
+          userdataPath = Path.of(argValue);
+          userdataPathSource = "CLI argument --user_data_path";
+        }
       }
     }
     // 4, create the directory if it doesn't exist yet; directory creation is also
@@ -713,7 +1134,7 @@ public class Freerouting {
     // These will be used to configure log4j2 BEFORE it initializes
     boolean fileLoggingEnabled = true;
     boolean consoleLoggingEnabled = true;
-    String fileLoggingLevel = "DEBUG";
+    String fileLoggingLevel = "INFO";
     String consoleLoggingLevel = "INFO";
     String fileLoggingLocation = null;
     String fileLoggingPattern = null;
@@ -791,6 +1212,10 @@ public class Freerouting {
     System.setProperty("freerouting.logging.file.enabled", String.valueOf(fileLoggingEnabled));
     System.setProperty("freerouting.logging.file.level", fileLoggingLevel);
     System.setProperty("freerouting.logging.file.location", fileLoggingLocation);
+
+    // The first thing the log says is where it lives. Both interfaces inherit this
+    // line, so "where do I watch progress" always has a printed answer.
+    FRLogger.info("Full log: " + fileLoggingLocation);
 
     if (fileLoggingPattern != null) {
       System.setProperty("freerouting.logging.file.pattern", fileLoggingPattern);
@@ -1018,16 +1443,29 @@ public class Freerouting {
         globalSettings.runtimeEnvironment.cpuCores, globalSettings.runtimeEnvironment.ram,
         globalSettings.runtimeEnvironment.host, width, height, dpi);
 
-    // check for new version
-    VersionChecker checker = new VersionChecker(Constants.FREEROUTING_VERSION);
-    new Thread(checker).start();
+    // The upstream version check is NOT started. Its endpoint announces upstream
+    // releases, so on this fork it produces a false "new version available" prompt --
+    // and an unexpected network call from fab-adjacent tooling. Re-enable only against
+    // an endpoint that speaks for THIS distribution.
 
     // Check if the user requested help
+    if (globalSettings.show_helpful_option) {
+      IO.print(HELPFUL_TEXT);
+      System.exit(0);
+    }
+
     if (globalSettings.show_help_option) {
       TextManager ctm = new TextManager(Freerouting.class, globalSettings.currentLocale);
       IO.print(ctm.getText("command_line_help"));
+      IO.print(OPTIMIZER_HELP_TEXT);
+      IO.print("\n  --helpful    How to actually get a good board: what the stages do, how"
+          + " long to give it,\n               and how to read what it tells you at the"
+          + " end.\n");
       System.exit(0);
     }
+
+    // Help never mutates state; every path past this line is a real run.
+    app.freerouting.settings.GlobalSettings.flushPendingMigrationSave();
 
     // Disable GUI and API if in DRC-only mode
     if (globalSettings.drc_report_file != null) {
@@ -1084,21 +1522,29 @@ public class Freerouting {
     }
 
     // If the GUI is disabled and the API server is not running, then we are in CLI mode
-    boolean cliResult = true;
+    CliOutcome cliOutcome = CliOutcome.COMPLETE;
     if (!globalSettings.guiSettings.isEnabled
         && !globalSettings.apiServerSettings.isRunning
         && !globalSettings.mcpServerSettings.isRunning) {
       if (globalSettings.drc_report_file != null) {
-        cliResult = InitializeDRC(globalSettings);
+        cliOutcome = InitializeDRC(globalSettings) ? CliOutcome.COMPLETE : CliOutcome.FAILED;
       } else {
-        cliResult = InitializeCLI(globalSettings);
+        cliOutcome = InitializeCLI(globalSettings);
       }
     }
 
-    if ((!cliResult) && !globalSettings.apiServerSettings.isEnabled && !globalSettings.mcpServerSettings.isEnabled) {
-      ShutdownApplication();
-      FRLogger.traceExit("MainApplication.main()");
-      System.exit(1);
+    // Legacy policy is bit-for-bit what it was: 0 for any run that produced a result,
+    // 1 for one that did not. With --outcome_exit_codes=true the four outcomes become
+    // distinguishable, which is what closes FS-X.
+    if (!globalSettings.apiServerSettings.isEnabled
+        && !globalSettings.mcpServerSettings.isEnabled) {
+      int outcomeExit = cliOutcome.exitCode(Boolean.TRUE.equals(globalSettings.outcomeExitCodes));
+      if (outcomeExit != 0) {
+        FRLogger.info("Exiting with status " + outcomeExit + " (" + cliOutcome + ").");
+        ShutdownApplication();
+        FRLogger.traceExit("MainApplication.main()");
+        System.exit(outcomeExit);
+      }
     }
 
     while (globalSettings.guiSettings.isRunning

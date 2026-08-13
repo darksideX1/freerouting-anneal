@@ -410,8 +410,11 @@ class GlobalSettingsUserDataPathTest {
         Files.createDirectories(customDir);
         GlobalSettings.setUserDataPath(customDir);
 
-        // Write a file with a version far older than any real current version.
-        Files.writeString(customDir.resolve("freerouting.json"), "{\"version\":\"1.0.0\"}");
+        // A version genuinely older than ours. This fixture said 1.0.0 and called it "far
+        // older than any real current version" -- an assumption about the product that the
+        // product then falsified by becoming 1.0.0, at which point the file compared equal
+        // and the warning this test exists to check simply did not fire.
+        Files.writeString(customDir.resolve("freerouting.json"), "{\"version\":\"0.9.0\"}");
 
         FRLogger.getLogEntries().clear();
         GlobalSettings.load();
@@ -421,7 +424,7 @@ class GlobalSettingsUserDataPathTest {
                 "load() must emit a warning when the config file version is older than the current version");
         assertTrue(
                 java.util.Arrays.stream(FRLogger.getLogEntries().get())
-                        .anyMatch(s -> s.contains("1.0.0") && s.contains("older")),
+                        .anyMatch(s -> s.contains("0.9.0") && s.contains("older")),
                 "The warning must mention the file version and describe it as 'older'");
     }
 

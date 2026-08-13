@@ -99,7 +99,12 @@ public class RoutingFixtureTest {
     job.state = RoutingJobState.READY_TO_START;
 
     long startTime = System.currentTimeMillis();
-    long timeoutInMillis = TextManager.parseTimespanString(job.routerSettings.jobTimeoutString) * 1000;
+    // The job's own budget PLUS a grace margin. This wait is a hang backstop, not a second
+    // deadline: its clock starts before the job's does (submission, parse), so at exactly
+    // the job budget it kills jobs that are finishing lawfully inside their own deadline.
+    // The governed multi-threaded optimiser made this visible by productively using its
+    // whole budget where the old single-threaded path converged early.
+    long timeoutInMillis = TextManager.parseTimespanString(job.routerSettings.jobTimeoutString) * 1000 + 30_000;
 
     while ((job.state != RoutingJobState.COMPLETED) && (job.state != RoutingJobState.CANCELLED)
         && (job.state != RoutingJobState.TERMINATED) && (job.state != RoutingJobState.TIMED_OUT)) {

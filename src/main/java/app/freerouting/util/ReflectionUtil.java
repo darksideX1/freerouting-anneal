@@ -92,6 +92,15 @@ public class ReflectionUtil {
     if (targetType.isInstance(value)) {
       return value;
     }
+    if (targetType.isEnum()) {
+      // CLI values arrive as strings; without this branch every enum-typed setting was
+      // reachable in name only -- the applier resolved the field, then refused the value.
+      // Case-insensitive: a user typing most_to_gain or MOST_TO_GAIN means the same thing.
+      @SuppressWarnings({"unchecked", "rawtypes"})
+      Object converted = Enum.valueOf((Class<? extends Enum>) targetType,
+          value.toString().trim().toUpperCase(java.util.Locale.ROOT));
+      return converted;
+    }
     if (targetType == int.class || targetType == Integer.class) {
       return Integer.parseInt(value.toString());
     }
@@ -100,6 +109,14 @@ public class ReflectionUtil {
     }
     if (targetType == double.class || targetType == Double.class) {
       return Double.parseDouble(value.toString());
+    }
+    if (targetType == float.class || targetType == Float.class) {
+      // Missing until defect 26. int, long, double and boolean were all here; float was
+      // not, so EVERY Float setting in the model was impossible to set -- the improvement
+      // threshold, the trace ripup cost factor, and the three scoring penalties. The
+      // failure surfaced as "unknown settings property", which sent the reader hunting for
+      // a misspelt name that was never wrong.
+      return Float.parseFloat(value.toString());
     }
     if (targetType == boolean.class || targetType == Boolean.class) {
       // convert "0" and "1" into their boolean values

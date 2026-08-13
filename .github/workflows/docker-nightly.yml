@@ -1,8 +1,11 @@
 name: Push the Docker nightly image
 
+# Push trigger removed deliberately. This fired on EVERY push to master and published
+# artifacts with nobody approving anything -- an image to a container registry, or
+# release assets. On a working repository that is a slow bleed of CI minutes for output
+# nobody consumes; on a fork it publishes under the forker's own account the first time
+# they push. Run it by hand when you actually want it.
 on:
-  push:
-    branches: [ "master" ]
   workflow_dispatch: # Allows you to run this workflow manually
 
 env:

@@ -21,6 +21,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.net.URI;
+import java.util.concurrent.TimeUnit;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -29,7 +30,27 @@ import org.eclipse.jetty.server.ServerConnector;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
+/**
+ * NOTE ON THE TIMEOUT BELOW.
+ *
+ * <p>This class hung in CI for a whole 9-minute job, repeatedly, on several branches
+ * including documentation-only commits. The log simply stopped after
+ * {@code method=tools/list} -- no assertion failure, no stack, no thread dump -- which is
+ * the least diagnosable failure shape there is, and it defeated three separate attempts at
+ * a root cause.
+ *
+ * <p>It could not be reproduced on the development machine: not with the full suite, not
+ * with parallel forks, not pinned to two cores. So rather than guess a fourth time, the
+ * timeout makes the NEXT occurrence produce evidence: a fast failure with a stack trace
+ * naming the thread and the line, instead of a silent budget burn.
+ *
+ * <p>The value is generous on purpose. It is not a performance assertion -- these tests
+ * start real Jetty servers and a slow shared runner is normal. It exists solely to convert
+ * a hang into a diagnosable failure.
+ */
+@Timeout(value = 120, unit = TimeUnit.SECONDS)
 class McpEndpointsTest {
 
   private static final String TEST_USER_ID = "00000000-0000-0000-0000-000000000001";

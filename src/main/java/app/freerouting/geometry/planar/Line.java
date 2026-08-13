@@ -18,6 +18,7 @@ public class Line implements Comparable<Line>, Serializable {
    * creates a directed Line from two Points
    */
   public Line(Point p_a, Point p_b) {
+    app.freerouting.datastructures.AllocationCensus.record("Line");
     a = p_a;
     b = p_b;
     dir = null;
@@ -30,6 +31,7 @@ public class Line implements Comparable<Line>, Serializable {
    * creates a directed Line from four integer Coordinates
    */
   public Line(int p_a_x, int p_a_y, int p_b_x, int p_b_y) {
+    app.freerouting.datastructures.AllocationCensus.record("Line");
     a = new IntPoint(p_a_x, p_a_y);
     b = new IntPoint(p_b_x, p_b_y);
     dir = null;
@@ -39,6 +41,7 @@ public class Line implements Comparable<Line>, Serializable {
    * creates a directed Line from a Point and a Direction
    */
   public Line(Point p_a, Direction p_dir) {
+    app.freerouting.datastructures.AllocationCensus.record("Line");
     a = p_a;
     b = p_a.translate_by(p_dir.get_vector());
     dir = p_dir;

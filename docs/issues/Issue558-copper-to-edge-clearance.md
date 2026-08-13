@@ -193,7 +193,7 @@ at the right threshold, it is architecturally incomplete as the single source of
 
 Based on the git log:
 
-- Commit `c4607ddb` ("Re-enable DevBoard clearance routing test", 2026-04-23): removed
+- Commit *Re-enable DevBoard clearance routing test* ("Re-enable DevBoard clearance routing test", 2026-04-23): removed
   the `@Disabled` annotation. Before this commit, the test was disabled with the reason
   "Temporary disabled: Freerouting leaves 2 items unconnected."
 - The referenced PR #567 ("might be part of the solution") is not yet merged.

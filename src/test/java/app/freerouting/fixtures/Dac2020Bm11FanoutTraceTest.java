@@ -20,6 +20,8 @@ public class Dac2020Bm11FanoutTraceTest extends RoutingFixtureTest {
     return ts;
   }
 
+  private static final int MIN_ESCAPED_PINS = 154;
+
   private static void assertFanoutOnlyJobSettings(RoutingJob job) {
     Assertions.assertFalse(
         job.routerSettings.getRunRouter(),
@@ -42,8 +44,8 @@ public class Dac2020Bm11FanoutTraceTest extends RoutingFixtureTest {
 
     BoardStatistics stats = new BoardStatistics(job.board);
     Assertions.assertTrue(
-        stats.fanout.escapedCount >= 154,
-        "Expected at least 154 escaped pins, but had " + stats.fanout.escapedCount + ".");
+        stats.fanout.escapedCount >= MIN_ESCAPED_PINS,
+        "Expected at least " + MIN_ESCAPED_PINS + " escaped pins, but had " + stats.fanout.escapedCount + ".");
   }
 
   @Test
@@ -58,7 +60,7 @@ public class Dac2020Bm11FanoutTraceTest extends RoutingFixtureTest {
         "Fanout Escape Statistics: escaped=" + stats.fanout.escapedCount + ", total=" + stats.fanout.totalSmdPins);
 
     Assertions.assertTrue(
-        stats.fanout.escapedCount >= 154,
-        "Expected at least 154 escaped pins, but had " + stats.fanout.escapedCount + ".");
+        stats.fanout.escapedCount >= MIN_ESCAPED_PINS,
+        "Expected at least " + MIN_ESCAPED_PINS + " escaped pins, but had " + stats.fanout.escapedCount + ".");
   }
 }

@@ -289,7 +289,9 @@ public class Simplex extends TileShape implements Serializable {
         return 2;
       }
       if (side_of_line0 == Side.ON_THE_LEFT) {
-        FRLogger.debug("empty Simplex not normalized");
+        if (FRLogger.isDebugEnabled()) {
+          FRLogger.debug("empty Simplex not normalized");
+        }
         return -1;
       }
       // now the 3 lines intersect in the same point

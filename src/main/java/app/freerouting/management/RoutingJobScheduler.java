@@ -430,8 +430,7 @@ public class RoutingJobScheduler {
           job.thread.requestStop();
         }
         saveJob(job);
-      } else if (!job.isCancelledByUser() && (job.state != RoutingJobState.COMPLETED)
-          && (job.state != RoutingJobState.TIMED_OUT) && (job.state != RoutingJobState.TERMINATED)) {
+      } else if (!job.isCancelledByUser() && !job.state.isTerminal()) {
         // If the job is in another state (e.g. PAUSED), we can still cancel it
         job.state = RoutingJobState.CANCELLED;
         job.setCancelledByUser(true);

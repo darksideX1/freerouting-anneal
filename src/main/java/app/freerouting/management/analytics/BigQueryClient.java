@@ -60,7 +60,38 @@ public class BigQueryClient implements AnalyticsClient {
   private final String LIBRARY_VERSION;
   /** The authenticated BigQuery service. Owned exclusively by this instance. */
   private final BigQuery bigQuery;
-  private boolean enabled = true;
+  // volatile for the cheap pre-thread check; the authoritative gate is transmissionLock,
+  // for the same reason as the sibling client: visibility is not atomicity.
+  private volatile boolean enabled = true;
+
+  /** See the sibling client: held across [consent check + insert], and by setEnabled. */
+  private final Object transmissionLock = new Object();
+
+  /**
+   * One bounded sender instead of a thread per request. The per-request threads all parked
+   * behind the transmission lock, so a slow BigQuery service accumulated an UNBOUNDED pile
+   * of blocked threads under sustained traffic. Telemetry may be DROPPED -- it is
+   * telemetry -- but it must never accumulate; a full queue discards the oldest entry and
+   * the drop is counted rather than silent.
+   */
+  private final java.util.concurrent.atomic.AtomicLong droppedSends =
+      new java.util.concurrent.atomic.AtomicLong();
+  private final java.util.concurrent.ThreadPoolExecutor sendExecutor =
+      new java.util.concurrent.ThreadPoolExecutor(1, 1, 60L,
+          java.util.concurrent.TimeUnit.SECONDS,
+          new java.util.concurrent.ArrayBlockingQueue<>(64),
+          r -> {
+            Thread t = new Thread(r, "bigquery-sender");
+            t.setDaemon(true);
+            return t;
+          },
+          (r, executor) -> {
+            long dropped = droppedSends.incrementAndGet();
+            if (dropped == 1 || dropped % 100 == 0) {
+              FRLogger.warn("BigQuery sender queue full: " + dropped
+                  + " payload(s) dropped so far. Telemetry is dropped, never accumulated.");
+            }
+          });
 
   // -------------------------------------------------------------------------
   // Factory
@@ -195,7 +226,9 @@ public class BigQueryClient implements AnalyticsClient {
 
   @Override
   public void setEnabled(boolean enabled) {
-    this.enabled = enabled;
+    synchronized (transmissionLock) {
+      this.enabled = enabled;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -211,7 +244,16 @@ public class BigQueryClient implements AnalyticsClient {
     // on mutable payload state.
     Map<String, String> fields = generateFieldsFromPayload(payload);
 
-    new Thread(() -> {
+    sendExecutor.execute(() -> {
+      // The lock makes the recheck atomic with the insert -- see the sibling client. With
+      // the single bounded worker, the lock is no longer a queue of blocked threads: the
+      // executor's bounded queue is the only waiting room, and it discards rather than
+      // grows.
+      synchronized (transmissionLock) {
+      if (!enabled) {
+        return;
+      }
+
       try {
         // Table name is the event name with some formatting.
         String tableName = payload.event
@@ -237,7 +279,8 @@ public class BigQueryClient implements AnalyticsClient {
       } catch (Exception e) {
         FRLogger.error("Exception in BigQueryClient.sendPayloadAsync: " + e.getMessage(), e);
       }
-    }).start();
+      }
+    });
   }
 
   private Map<String, String> generateFieldsFromPayload(Payload payload) {

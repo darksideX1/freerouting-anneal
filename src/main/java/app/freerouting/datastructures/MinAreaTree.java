@@ -3,8 +3,9 @@ package app.freerouting.datastructures;
 import app.freerouting.geometry.planar.RegularTileShape;
 import app.freerouting.geometry.planar.ShapeBoundingDirections;
 import app.freerouting.logger.FRLogger;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * Binary search tree for shapes in the plane. The shapes are stored in the leaves of the tree. The algorithm for storing a new shape is as following. Starting from the root go to the child, so that
@@ -23,12 +24,45 @@ public class MinAreaTree extends ShapeTree {
   /**
    * Calculates the objects in this tree, which overlap with p_shape
    */
-  public Set<Leaf> overlaps(RegularTileShape p_shape) {
-    Set<Leaf> found_overlaps = new TreeSet<>();
+  /**
+   * Scratch stack for {@link #overlaps}, reused across calls.
+   *
+   * <p>US-3. A fresh {@code ArrayStack} per query was <b>8.1% of all allocation</b> on
+   * bm01 -- the largest single site in our own code, ahead of every geometry type. The
+   * stack is scratch space for one tree walk: it is empty before the walk and empty after
+   * it, so nothing about it needs to be per-call except that it starts empty, which
+   * {@code reset()} guarantees.
+   *
+   * <p>THREAD-LOCAL, deliberately, not a plain field. This tree is reachable from several
+   * routing threads, and this fork has already had one intermittent crash caused by
+   * concurrent access to shared search-tree state. A shared scratch stack would be exactly
+   * that bug again, in a place that looks like an optimisation. One stack per thread costs
+   * a map lookup and removes the question entirely.
+   *
+   * <p>The threads that touch this are per-job rather than pooled for the process lifetime,
+   * so the usual thread-local retention concern does not apply here.
+   */
+  private final ThreadLocal<ArrayStack<TreeNode>> traversal_stack =
+      ThreadLocal.withInitial(() -> new ArrayStack<>(10000));
+
+  public List<Leaf> overlaps(RegularTileShape p_shape) {
+    // A list, not a TreeSet. JFR attributed 3.36 GB to this method -- 42% of every
+    // TreeMap$Entry allocated on a power-b2 route -- purely to hold the results.
+    //
+    // The Set was never deduplicating: this walk descends a tree, every node has one
+    // parent, so a leaf is reached at most once and a duplicate cannot occur. What it was
+    // doing is ordering, which callers do depend on, so the list is sorted before it is
+    // returned. Leaf is Comparable and there are no duplicates, so a sorted list is exactly
+    // the sequence the TreeSet produced.
+    List<Leaf> found_overlaps = new ArrayList<>();
     if (this.root == null) {
       return found_overlaps;
     }
-    ArrayStack<TreeNode> node_stack = new ArrayStack<>(10000);
+    // reset() rather than a new stack: emptied, not merely rewound -- pinned by
+    // ArrayStackReuseTest, which exists because stale residue would surface as phantom
+    // overlaps three layers up rather than as an obvious failure here.
+    ArrayStack<TreeNode> node_stack = traversal_stack.get();
+    node_stack.reset();
     node_stack.push(this.root);
     TreeNode curr_node;
     for (; ; ) {
@@ -45,6 +79,7 @@ public class MinAreaTree extends ShapeTree {
         }
       }
     }
+    Collections.sort(found_overlaps);
     return found_overlaps;
   }
 

@@ -290,10 +290,12 @@ public abstract class Trace extends Item implements Connectable, Serializable {
     boolean debugNet49 = this.net_no_arr != null && this.net_no_arr.length > 0 && this.net_no_arr[0] == 49;
     if (this.is_overlap()) {
       if (debugNet49) {
-        FRLogger.trace("compare_trace_is_cycle_overlap net=49, id=" + this.get_id_no()
-            + ", first=" + this.first_corner() + ", last=" + this.last_corner()
-            + ", start_contacts=" + this.get_start_contacts().stream().map(i->i.get_id_no()+"").collect(java.util.stream.Collectors.joining(","))
-            + ", end_contacts=" + this.get_end_contacts().stream().map(i->i.get_id_no()+"").collect(java.util.stream.Collectors.joining(",")));
+        if (FRLogger.isTraceEnabled()) {
+          FRLogger.trace("compare_trace_is_cycle_overlap net=49, id=" + this.get_id_no()
+              + ", first=" + this.first_corner() + ", last=" + this.last_corner()
+              + ", start_contacts=" + this.get_start_contacts().stream().map(i->i.get_id_no()+"").collect(java.util.stream.Collectors.joining(","))
+              + ", end_contacts=" + this.get_end_contacts().stream().map(i->i.get_id_no()+"").collect(java.util.stream.Collectors.joining(",")));
+        }
       }
       return true;
     }
@@ -314,10 +316,12 @@ public abstract class Trace extends Item implements Connectable, Serializable {
     for (Item curr_contact : start_contacts) {
       if (curr_contact.is_cycle_recu(visited_items, this, this, ignore_areas)) {
         if (debugNet49) {
-          FRLogger.trace("compare_trace_is_cycle_dfs net=49, id=" + this.get_id_no()
-              + ", first=" + this.first_corner() + ", last=" + this.last_corner()
-              + ", start_contacts=" + start_contacts.stream().map(i->i.get_id_no()+"").collect(java.util.stream.Collectors.joining(","))
-              + ", found_via=" + curr_contact.get_id_no());
+          if (FRLogger.isTraceEnabled()) {
+            FRLogger.trace("compare_trace_is_cycle_dfs net=49, id=" + this.get_id_no()
+                + ", first=" + this.first_corner() + ", last=" + this.last_corner()
+                + ", start_contacts=" + start_contacts.stream().map(i->i.get_id_no()+"").collect(java.util.stream.Collectors.joining(","))
+                + ", found_via=" + curr_contact.get_id_no());
+          }
         }
         return true;
       }
@@ -357,7 +361,7 @@ public abstract class Trace extends Item implements Connectable, Serializable {
     }
     for (int i = 0; i < result.length; i++) {
       if (result[i] == null) {
-        return new Point[0]; // Trace is inconsistent
+        return Point.EMPTY; // Trace is inconsistent
       }
     }
     return result;

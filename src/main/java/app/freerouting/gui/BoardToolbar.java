@@ -225,9 +225,22 @@ class BoardToolbar extends JPanel {
         _ -> FRAnalytics.buttonClicked("toolbar_autoroute_button", GsonProvider.GSON.toJson(globalSettings)));
     middle_toolbar.add(toolbar_autoroute_button);
 
-    // Add "Cancel" button to the toolbar
+    // The button below stops the run and KEEPS the board routed so far. It is named for
+    // what it does. It used to be labelled "Cancel", which described the opposite: nobody
+    // pressing Cancel can know their work survives it, and the person with a long run they
+    // want to end early is exactly the person who will not risk finding out.
+    //
+    // Behaviour is unchanged -- stop_autorouter_and_route_optimizer() requests the stop and
+    // AutorouterAndRouteOptimizerThread commits the routed board unconditionally once the
+    // loop ends. Only the label was ever wrong.
     cancel_button = new JButton();
     tm.setText(cancel_button, "cancel_button");
+    // Overrides the translated label deliberately: the string resource says Cancel in every
+    // language, and every one of them is wrong about what the button does.
+    cancel_button.setText("Stop");
+    cancel_button.setToolTipText(
+        "Stop routing and keep the board routed so far. The current pass finishes first, so"
+            + " the result is a complete board rather than a half-applied one.");
     cancel_button.addActionListener(_ -> {
       board_frame.board_panel.board_handling.stop_autorouter_and_route_optimizer();
     });

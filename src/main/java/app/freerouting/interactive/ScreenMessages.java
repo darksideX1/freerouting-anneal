@@ -104,24 +104,80 @@ public class ScreenMessages {
     layer_field.setText(tm.getText("interactive_autoroute_layer", String.valueOf(found), String.valueOf(failed)));
   }
 
+  /** The router's own counters, cached so the clock can be rendered beside them. */
+  private String routerInfoText = empty_string;
+  /** The wall clock, cached so a counter update does not erase it. */
+  private String routingClockText = empty_string;
+  /** Ticks the clock once a second while the router is working. */
+  private javax.swing.Timer routingClockTimer;
+
+  private void renderAddField() {
+    if (routingClockText.isEmpty()) {
+      add_field.setText(routerInfoText);
+    } else if (routerInfoText.isEmpty()) {
+      add_field.setText(routingClockText);
+    } else {
+      add_field.setText(routerInfoText + "   " + routingClockText);
+    }
+  }
+
+  /**
+   * Starts the elapsed/limit clock.
+   *
+   * <p>Ticks every second even when the router itself reports nothing for minutes at a
+   * time -- which is the whole point. A fanout pass on a real board has run for 284
+   * seconds without a single progress event, and during that silence the only honest
+   * signal that anything is alive is the clock moving.
+   *
+   * @param limitSeconds the wall-clock limit, or {@code null} if none applies
+   */
+  public void start_routing_clock(Long limitSeconds) {
+    stop_routing_clock();
+    final long startedAtMillis = System.currentTimeMillis();
+    routingClockText = app.freerouting.core.RoutingProgress.format(0, limitSeconds);
+    renderAddField();
+    routingClockTimer = new javax.swing.Timer(1000, _ -> {
+      long elapsed = (System.currentTimeMillis() - startedAtMillis) / 1000L;
+      routingClockText = app.freerouting.core.RoutingProgress.format(elapsed, limitSeconds);
+      renderAddField();
+    });
+    routingClockTimer.start();
+  }
+
+  /** Stops the clock and removes it from the status bar. Safe to call when not running. */
+  public void stop_routing_clock() {
+    if (routingClockTimer != null) {
+      routingClockTimer.stop();
+      routingClockTimer = null;
+    }
+    routingClockText = empty_string;
+    renderAddField();
+  }
+
   public void set_batch_autoroute_info(RouterCounters routerCounters) {
     int items_to_go = routerCounters.queuedToBeRoutedCount;
     int routed = routerCounters.routedCount;
     int failed = routerCounters.failedToBeRoutedCount;
     if ("fanout".equals(routerCounters.phase)) {
       int extraVias = routerCounters.fanoutExtraViasCount == null ? 0 : routerCounters.fanoutExtraViasCount;
-      add_field.setText(tm.getText("batch_autoroute_add", String.valueOf(items_to_go), String.valueOf(routed)));
+      routerInfoText = tm.getText("batch_autoroute_add", String.valueOf(items_to_go), String.valueOf(routed));
+      renderAddField();
       layer_field.setText(tm.getText("batch_fanout_layer", String.valueOf(failed), String.valueOf(extraVias)));
       return;
     }
     int ripped = routerCounters.rippedCount;
-    add_field.setText(tm.getText("batch_autoroute_add", String.valueOf(items_to_go), String.valueOf(routed)));
+    routerInfoText = tm.getText("batch_autoroute_add", String.valueOf(items_to_go), String.valueOf(routed));
+    renderAddField();
     layer_field.setText(tm.getText("batch_autoroute_layer", String.valueOf(ripped), String.valueOf(failed)));
   }
 
   public void set_post_route_info(int p_via_count, double p_trace_length, Unit unit) {
+    // Routing is finished by the time these figures exist, so this is the backstop that
+    // guarantees the clock cannot keep ticking after the run has ended.
+    stop_routing_clock();
     int via_count = p_via_count;
-    add_field.setText(tm.getText("post_route_add", String.valueOf(via_count)));
+    routerInfoText = tm.getText("post_route_add", String.valueOf(via_count));
+    add_field.setText(routerInfoText);
     layer_field.setText(tm.getText("post_route_layer", this.number_format.format(p_trace_length), unit.toString()));
   }
 

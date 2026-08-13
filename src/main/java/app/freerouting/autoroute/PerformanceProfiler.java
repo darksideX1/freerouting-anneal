@@ -79,18 +79,30 @@ public class PerformanceProfiler {
      * Print profiling results sorted by total time
      */
     public static void printResults() {
-        FRLogger.debug("=== Performance Profile ===");
+        if (FRLogger.isDebugEnabled()) {
+          FRLogger.debug("=== Performance Profile ===");
+        }
 
         if (configInfo != null) {
-            FRLogger.debug("=== Routing Parameters ===");
-            FRLogger.debug(String.format("  Via Costs: %d, Plane Via Costs: %d", configInfo.viaCosts,
-                    configInfo.planeViaCosts));
-            FRLogger.debug("  Layer Costs (Preferred / Against):");
-            for (int i = 0; i < configInfo.preferredCosts.length; i++) {
-                FRLogger.debug(String.format("    Layer %d: %.1f / %.1f", i + 1, configInfo.preferredCosts[i],
-                        configInfo.againstCosts[i]));
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug("=== Routing Parameters ===");
             }
-            FRLogger.debug("");
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug(String.format("  Via Costs: %d, Plane Via Costs: %d", configInfo.viaCosts,
+                      configInfo.planeViaCosts));
+            }
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug("  Layer Costs (Preferred / Against):");
+            }
+            for (int i = 0; i < configInfo.preferredCosts.length; i++) {
+                if (FRLogger.isDebugEnabled()) {
+                  FRLogger.debug(String.format("    Layer %d: %.1f / %.1f", i + 1, configInfo.preferredCosts[i],
+                          configInfo.againstCosts[i]));
+                }
+            }
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug("");
+            }
         }
 
         timings.entrySet().stream()
@@ -101,25 +113,35 @@ public class PerformanceProfiler {
                     long count = counts.get(section).get();
                     long avgMs = count > 0 ? totalMs / count : 0;
 
-                    FRLogger.debug(String.format("  %-40s: %8d ms total, %8d calls, %6d ms avg",
-                            section, totalMs, count, avgMs));
+                    if (FRLogger.isDebugEnabled()) {
+                      FRLogger.debug(String.format("  %-40s: %8d ms total, %8d calls, %6d ms avg",
+                              section, totalMs, count, avgMs));
+                    }
                 });
 
         if (!passHistory.isEmpty()) {
-            FRLogger.debug("");
-            FRLogger.debug("=== Pass History ===");
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug("");
+            }
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug("=== Pass History ===");
+            }
             synchronized (passHistory) {
                 // Sort by pass info just in case threads messed up order, though auto-router is
                 // single threaded per board usually
                 passHistory.sort(java.util.Comparator.comparingInt(p -> p.passNo));
                 for (PassInfo pass : passHistory) {
-                    FRLogger.debug(String.format("  Pass %-3d: %4d unrouted items, %8.2f s, %5d ripup cost",
-                            pass.passNo, pass.unroutedItems, pass.durationMs / 1000.0, pass.ripupCost));
+                    if (FRLogger.isDebugEnabled()) {
+                      FRLogger.debug(String.format("  Pass %-3d: %4d unrouted items, %8.2f s, %5d ripup cost",
+                              pass.passNo, pass.unroutedItems, pass.durationMs / 1000.0, pass.ripupCost));
+                    }
                 }
             }
         }
 
-        FRLogger.debug("===========================");
+        if (FRLogger.isDebugEnabled()) {
+          FRLogger.debug("===========================");
+        }
     }
 
     /**

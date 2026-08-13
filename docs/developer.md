@@ -13,36 +13,70 @@
 
 ### Requirements
 
-- Java >= 25 ([Adoptium Temurin 25 JRE](https://adoptium.net/temurin/releases/))
-- [Gradle 9.x](https://gradle.org/releases/)
-- Internet connection (dependencies are downloaded automatically)
-- For IDE integration: Gradle extension (not necessary for command line usage)
+- **Java 25** ([Adoptium Temurin 25 JDK](https://adoptium.net/temurin/releases/)) — a JDK,
+  not just a JRE.
+- An internet connection on the first build (dependencies download once).
+
+**You do not need to install Gradle.** The repository ships the Gradle wrapper
+(`gradlew` / `gradlew.bat`), which fetches the correct version itself. An earlier version
+of this page listed Gradle 9.x as a requirement; installing it is wasted effort.
+
+### Build it
+
+The same task on every platform:
+
+```bash
+./gradlew executableJar      # Linux, macOS, Git Bash
+gradlew.bat executableJar    # Windows CMD / PowerShell
+```
+
+That writes three jars into `build/libs`:
+
+| file | what it is |
+|---|---|
+| `freerouting-current-executable.jar` | **the one you run** — every dependency bundled in |
+| `freerouting.jar` | classes only: no manifest, no dependencies, not runnable alone |
+| `freerouting-sources.jar` | sources, for attaching in an IDE |
+
+Check it works:
+
+```bash
+java -jar build/libs/freerouting-current-executable.jar --help
+```
+
+The first line names the version and the commit it was built from, e.g.
+`Freerouting v1.1.1 (build c4d2d369, build-date: 2026-08-13)`. A `-dirty` suffix means the
+tree was modified when that jar was built, so it is not the commit it names and nobody can
+reproduce it from that sha — fine for your own experiment, never for a result someone else
+has to trust.
+
+> **Do not use `./gradlew assemble` for a runnable build.** It succeeds, but it produces
+> only `freerouting.jar` and `freerouting-sources.jar` — not the executable jar — and
+> running the jar it does produce fails with `no main manifest attribute`. This page used
+> to recommend `assemble` for Linux/macOS and `executableJar` for Windows. The Windows
+> instruction was the correct one; the other sent you into a dead end on step one.
+
+### Run the tests
+
+```bash
+./gradlew test
+```
+
+Two things to know before you read the output:
+
+- **`SessionManagerTest` fails 5 of 6 on `master`.** It is a test-isolation problem
+  (`globalSettings` is null when the class runs after others), it is unowned, and it
+  predates this fork's work. If you see it on a fresh clone, you did not break it.
+- **Some tests read files Gradle does not track as inputs** to the `test` task — build
+  files, workflows, the KiCad manifests. After editing one of those, an incremental run
+  reports the task up-to-date and silently skips them. Use `./gradlew test --rerun-tasks`
+  when you have changed a file of that kind. CI checks out fresh, so it always runs them.
 
 ### IDE
 
-Open the `freerouting` [Gradle](http://www.gradle.org/) project in your favourite IDE (NB, IntelliJ, Eclipse etc. with Gradle Plugin) and build it by calling the `assemble` task.
-
-### Command Line
-
-Navigate to the [Gradle](http://www.gradle.org/) project (e.g., `path/to/freerouting`) and enter the following command
-
-#### Bash (Linux/OS X/Cygwin/other Unix-like shell)
-
-``` bash
-./gradlew assemble
-```
-
-#### Windows (CMD)
-
-```powershell
-gradlew executableJar
-```
-
-![image](https://user-images.githubusercontent.com/910321/143483981-5f1f8473-098e-4cf2-997b-a34d14346853.png)
-
-#### Generated Executables
-
-All four .jar files will be generated in the `build\libs` subfolder. You would typically run the `freerouting-current-executable.jar` file.
+Open the project as a [Gradle](http://www.gradle.org/) project (IntelliJ, Eclipse,
+NetBeans — anything with Gradle support) and run the **`executableJar`** task. Not
+`assemble`, for the reason above.
 
 ## Translations (i18n)
 
@@ -88,12 +122,19 @@ Let's suppose that the new version is `2.3.4`. You need to complete these steps:
 * Create a new draft release
 * Run `gradlew.bat executableJar` -> this will generate the files in `\build\libs\freerouting*.jar`
 * Rename to `freerouting-current-executable.jar` to `freerouting-2.3.4.jar`
-* Update the `integrations\KiCad`
-    * Copy `freerouting-2.3.4.jar` into `\integrations\KiCad\kicad-freerouting\plugins\jar\`
-    * Update `\integrations\KiCad\kicad-freerouting\plugins\plugin.ini` with the new filename
-    * Update `\integrations\KiCad\kicad-freerouting\metadata.json`
-    * Create a ZIP file from the `kicad-freerouting` folder
-    * Copy this `kicad-freerouting.zip` file to `kicad-freerouting-2.3.4.zip`
+* The `integrations/KiCad` plugin archive is built by the release, not by hand:
+
+  ```bash
+  ./gradlew kicadPlugin      # -> build/dist/kicad-freerouting-<version>.zip
+  ```
+
+  The jar is staged into the archive at build time and is deliberately **not** committed:
+  a jar sitting in the tree makes the tree dirty, so the jar inside it reports a build
+  nobody can reproduce from the sha it names. `create-release.yml` runs this task and
+  uploads the archive as a release asset, which is where `metadata.json` points.
+
+  This replaced an eight-step manual ritual that named `freerouting-2.3.4.jar` -- a
+  version this fork has never had.
     * Use KiCad Packager
       from [https://gitlab.com/kicad/addons/metadata/tools](https://gitlab.com/kicad/addons/metadata/-/tree/main/tools)
       to get hash and file sizes

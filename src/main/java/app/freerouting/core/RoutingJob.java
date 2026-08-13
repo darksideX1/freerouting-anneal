@@ -8,6 +8,7 @@ import app.freerouting.core.events.RoutingJobUpdatedEventListener;
 import app.freerouting.io.specctra.RulesReader;
 import app.freerouting.io.FileFormat;
 import app.freerouting.logger.FRLogger;
+import java.util.function.Supplier;
 import app.freerouting.logger.LogEntry;
 import app.freerouting.settings.DesignRulesCheckerSettings;
 import app.freerouting.settings.RouterSettings;
@@ -98,6 +99,26 @@ public class RoutingJob implements Serializable, Comparable<RoutingJob> {
   public transient StoppableThread thread;
   public transient RoutingBoard board;
   public transient Instant timeoutAt;
+  /**
+   * True when a STAGE stopped because its time ran out, even though the job as a whole
+   * reached a normal final state.
+   *
+   * <p>Stages derive their deadline from the job's and stop just inside it, so a run cut
+   * short by the clock still ends with the job COMPLETED. Without this, "the clock stopped
+   * it" and "it stopped finding improvements" are indistinguishable from the outside -- and
+   * they are the only two things a user needs to tell apart, because one means try again
+   * with a longer budget and the other means do not bother.
+   */
+  public transient boolean stageTimedOut = false;
+  /**
+   * True when a person ended this run -- the Stop key, the Stop button, or a signal.
+   *
+   * <p>A stop that keeps the board leaves the job in a normal final state, so the state alone
+   * cannot distinguish "the router ran out of things to improve" from "somebody stopped it".
+   * Reporting the first when the second happened tells a user their board is as good as it
+   * gets, which may be untrue and is the one thing this message must never get wrong.
+   */
+  public transient boolean stoppedByUser = false;
   private boolean isCancelledByUser = false;
 
   public boolean isCancelledByUser() {
@@ -497,7 +518,27 @@ public class RoutingJob implements Serializable, Comparable<RoutingJob> {
   }
 
   public void logDebug(String message) {
+    if (!FRLogger.isDebugEnabled()) {
+      // The prefix concatenation, the call and the event were all happening at every
+      // level. FRLogger.debug does not add to logEntries -- unlike info/warn/error -- so
+      // nothing that reaches the UI log pane is lost by returning here.
+      return;
+    }
     LogEntry logEntry = FRLogger.debug("[" + this.shortName + "] " + message, this.id);
     fireLogEntryAddedEvent(logEntry);
+  }
+
+  /**
+   * Debug log with a deferred message.
+   *
+   * <p>The guard above saves this method's own work, but not the caller's: the argument to
+   * {@code logDebug("a" + b + "c")} is built before the call is even made. Callers that
+   * concatenate should use this overload, where nothing is built unless the level is on.
+   */
+  public void logDebug(Supplier<String> message) {
+    if (!FRLogger.isDebugEnabled()) {
+      return;
+    }
+    logDebug(message.get());
   }
 }

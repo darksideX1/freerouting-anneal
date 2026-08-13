@@ -321,6 +321,13 @@ public final class KiCadJsonReader {
         netClassIndexMap.put(nc.name, clNo);
       }
 
+      // Upstream issue #558. KiCad knows the board's copper-to-edge clearance and the
+      // JSON bridge carries it, but it used to be parsed and discarded -- traces were
+      // placed at the ordinary conductor-to-conductor clearance from the board edge and
+      // KiCad's own DRC then failed a board this router had just reported as clean.
+      applyOutlineClearance(board, clearanceMatrix, boardJson.outline, scaleFactor,
+          outlineGenerated);
+
       // Create via rules and register via padstacks so that the router is allowed to use vias
       double defaultViaDiameter = 0.8;
       double defaultViaDrill = 0.4;
@@ -895,6 +902,73 @@ public final class KiCadJsonReader {
       }
     }
     return result;
+  }
+
+  /** Clearance class name for the board edge; matches the DSN/CLI path. */
+  private static final String BOARD_EDGE_CLEARANCE_CLASS_NAME = "board_edge";
+
+  /**
+   * Gives the board outline its own clearance class from KiCad's declared
+   * copper-to-edge clearance (upstream issue #558).
+   *
+   * <p>Must run AFTER every net class has been appended. Creating the class earlier --
+   * where {@code outlineClearanceNo} is chosen -- would leave its values against
+   * later-added classes unset, producing a clearance class that is present and
+   * silently incomplete. It also must not reuse {@code outlineClearanceNo} itself,
+   * which is additionally the pin clearance class: changing that would move every
+   * pin's clearance as a side effect of an edge-clearance fix.
+   *
+   * <p>A board that declares no edge clearance is left exactly as it was. An explicit
+   * CLI override still wins later: {@code applyCopperToEdgeClearanceOverride} only
+   * preserves an existing outline class while the configured value is the default,
+   * so the precedence rule lives in one place rather than two that could disagree.
+   */
+  private static void applyOutlineClearance(RoutingBoard board, ClearanceMatrix matrix,
+      KiCadBoardJson.OutlineJson outline, double scaleFactor, boolean outlineGenerated) {
+    if (board == null || matrix == null || outline == null || outlineGenerated) {
+      return;
+    }
+    if (!(outline.clearance > 0)) {
+      return; // nothing declared: keep the existing default behaviour untouched
+    }
+    var boardOutline = board.get_outline();
+    if (boardOutline == null) {
+      return;
+    }
+    int clearanceBoardUnits = (int) Math.round(outline.clearance * scaleFactor);
+    if (clearanceBoardUnits <= 0) {
+      return; // rounds away to nothing at this resolution
+    }
+
+    int boardEdgeClassNo = matrix.get_no(BOARD_EDGE_CLEARANCE_CLASS_NAME);
+    if (boardEdgeClassNo < 0) {
+      matrix.append_class(BOARD_EDGE_CLEARANCE_CLASS_NAME);
+      boardEdgeClassNo = matrix.get_no(BOARD_EDGE_CLEARANCE_CLASS_NAME);
+    }
+    if (boardEdgeClassNo < 0) {
+      FRLogger.warn("Unable to create the board_edge clearance class; the declared "
+          + "copper-to-edge clearance of " + outline.clearance + " was not applied.");
+      return;
+    }
+
+    for (int layer = 0; layer < matrix.get_layer_count(); layer++) {
+      for (int classNo = 1; classNo < matrix.get_class_count(); classNo++) {
+        matrix.set_value(boardEdgeClassNo, classNo, layer, clearanceBoardUnits);
+        matrix.set_value(classNo, boardEdgeClassNo, layer, clearanceBoardUnits);
+      }
+    }
+
+    if (board.search_tree_manager != null) {
+      board.search_tree_manager.remove(boardOutline);
+    }
+    boardOutline.set_clearance_class_no(boardEdgeClassNo);
+    boardOutline.clear_derived_data();
+    if (board.search_tree_manager != null) {
+      board.search_tree_manager.insert(boardOutline);
+    }
+
+    FRLogger.debug("Applied KiCad copper-to-edge clearance from JSON: "
+        + outline.clearance + " (" + clearanceBoardUnits + " board units).");
   }
 
   private static void applyKiCadNetClassParameters(

@@ -24,6 +24,8 @@ class BoardPanelStatus extends JPanel {
   public final JLabel warningLabel;
   public final JLabel statusMessage;
   public final JLabel additionalMessage;
+  /** The session log path, always visible in the footer. */
+  public final JLabel logFileLabel;
   public final JLabel currentLayer;
   public final JLabel currentBoardScore;
   public final JLabel mousePosition;
@@ -89,7 +91,26 @@ class BoardPanelStatus extends JPanel {
     additionalMessage.setMaximumSize(new Dimension(300, 14));
     additionalMessage.setMinimumSize(new Dimension(140, 14));
     additionalMessage.setPreferredSize(new Dimension(180, 14));
-    errorsWarningsPanel.add(additionalMessage, BorderLayout.EAST);
+
+    // The current session's log file, permanently visible left of the clock. A run that
+    // goes quiet for minutes has exactly two honest progress signals: the ticking clock
+    // and the log -- and after three hours nobody remembers where the log was. The
+    // label ellipsizes; the tooltip carries the full path.
+    logFileLabel = new SmartLabel();
+    String logLocation = System.getProperty("freerouting.logging.file.location");
+    if (logLocation != null && !logLocation.isBlank()) {
+      logFileLabel.setText("log: " + logLocation);
+      logFileLabel.setToolTipText(logLocation);
+    }
+    logFileLabel.setMaximumSize(new Dimension(420, 14));
+    logFileLabel.setMinimumSize(new Dimension(80, 14));
+    logFileLabel.setPreferredSize(new Dimension(260, 14));
+
+    javax.swing.JPanel eastPanel = new javax.swing.JPanel(new BorderLayout());
+    eastPanel.setOpaque(false);
+    eastPanel.add(logFileLabel, BorderLayout.WEST);
+    eastPanel.add(additionalMessage, BorderLayout.EAST);
+    errorsWarningsPanel.add(eastPanel, BorderLayout.EAST);
     add(errorsWarningsPanel, BorderLayout.CENTER);
 
     // Right panel with current layer and cursor position

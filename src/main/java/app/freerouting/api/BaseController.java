@@ -44,34 +44,84 @@ public class BaseController {
    *         resolvable UUID.
    */
   protected UUID AuthenticateUser() {
-    String userIdString = httpHeaders.getHeaderString("Freerouting-Profile-ID");
-    String userEmailString = httpHeaders.getHeaderString("Freerouting-Profile-Email");
+    return resolveUserId(
+        httpHeaders.getHeaderString("Freerouting-Profile-ID"),
+        httpHeaders.getHeaderString("Freerouting-Profile-Email"),
+        isApiAuthenticationEnabled());
+  }
 
-    if (((userIdString == null) || (userIdString.isEmpty())) && ((userEmailString == null) || (userEmailString.isEmpty()))) {
-      throw new IllegalArgumentException("Freerouting-Profile-ID or Freerouting-Profile-Email HTTP request header must be set in order to get authenticated.");
+  /** The caller when authentication is switched off: anonymous, local, and stable. */
+  private static final UUID ANONYMOUS_LOCAL_USER =
+      UUID.fromString("00000000-0000-4000-8000-000000000001");
+
+  /**
+   * Resolves the calling user, honouring whether authentication is switched on.
+   *
+   * <p>Pure and package-visible so the precedence can be tested and argued with. Two
+   * things were untrue here before:
+   *
+   * <p><b>The setting did not do what its name says.</b> There are two independent gates
+   * on this API: {@code ApiKeyValidationService} honours
+   * {@code api_server.authentication.enabled=false} and lets requests through without a
+   * Bearer key, while this method consulted nothing and demanded a profile header
+   * regardless. So "authentication disabled" disabled one gate of two, and the caller got
+   * a 500 about headers they had never heard of.
+   *
+   * <p><b>The error advertised an option that could not work.</b> It named
+   * {@code Freerouting-Profile-Email} as an alternative, but e-mail resolution was an
+   * unimplemented TODO, so supplying only an e-mail always failed. It now derives a
+   * stable identity from the address. That is identity, not authorization — the API key
+   * is the gate, and this only decides which session the caller owns.
+   *
+   * @throws IllegalArgumentException when authentication is ON and the caller did not
+   *     identify itself at all
+   */
+  static UUID resolveUserId(String idHeader, String emailHeader, boolean authenticationEnabled) {
+    boolean noId = (idHeader == null) || idHeader.isEmpty();
+    boolean noEmail = (emailHeader == null) || emailHeader.isEmpty();
+
+    if (noId && noEmail) {
+      if (!authenticationEnabled) {
+        // "Allow all requests through" is the documented intent of disabling
+        // authentication -- for embedded uses such as a KiCad plugin. A fixed id rather
+        // than a fresh one per request, because session ownership is keyed on it and a
+        // caller must be able to retrieve the job it just created.
+        return ANONYMOUS_LOCAL_USER;
+      }
+      throw new IllegalArgumentException(
+          "Freerouting-Profile-ID or Freerouting-Profile-Email HTTP request header must be"
+              + " set in order to get authenticated. If you are running this server"
+              + " locally, --api_server.authentication.enabled=false removes this"
+              + " requirement.");
     }
 
-    UUID userId = null;
-
-    // We need to get the userId from the e-mail address first
-    if ((userIdString != null) && (!userIdString.isEmpty())) {
+    if (!noId) {
       try {
-        userId = UUID.fromString(userIdString);
+        return UUID.fromString(idHeader);
       } catch (IllegalArgumentException _) {
-        // We couldn't parse the userId, so we fall back to e-mail address
+        // Not a UUID. The caller still identified itself; fall through to the e-mail.
       }
     }
 
-    if ((userEmailString != null) && (!userEmailString.isEmpty())) {
-      // TODO: get userId from e-mail address
+    if (!noEmail) {
+      return UUID.nameUUIDFromBytes(
+          emailHeader.trim().toLowerCase(java.util.Locale.ROOT)
+              .getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
-    if (userId == null) {
-      throw new IllegalArgumentException("The user couldn't be authenticated based on the Freerouting-Profile-ID or Freerouting-Profile-Email HTTP request header values.");
+    throw new IllegalArgumentException(
+        "The Freerouting-Profile-ID header '" + idHeader + "' is not a valid UUID, and no"
+            + " Freerouting-Profile-Email was supplied to fall back to.");
+  }
+
+  /** Fails CLOSED: if the setting cannot be read, the header stays required. */
+  private static boolean isApiAuthenticationEnabled() {
+    try {
+      var authentication =
+          app.freerouting.Freerouting.globalSettings.apiServerSettings.authentication;
+      return (authentication == null) || !Boolean.FALSE.equals(authentication.isEnabled);
+    } catch (Exception e) {
+      return true;
     }
-
-    // TODO: authenticate the user by calling the auth endpoint
-
-    return userId;
   }
 }

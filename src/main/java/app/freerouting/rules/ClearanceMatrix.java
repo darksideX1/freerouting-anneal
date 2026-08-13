@@ -138,12 +138,12 @@ public class ClearanceMatrix implements Serializable {
 
     if (p_i < 0 || p_i >= class_count || p_j < 0 || p_j >= class_count || p_layer < 0 || p_layer >= layer_structure.arr.length) {
       FRLogger.trace("ClearanceMatrix.get_value", "out_of_bounds",
-          "Clearance request out of bounds: class_i=" + p_i + " (max=" + (class_count - 1) + ")"
+          () -> "Clearance request out of bounds: class_i=" + p_i + " (max=" + (class_count - 1) + ")"
               + ", class_j=" + p_j + " (max=" + (class_count - 1) + ")"
               + ", layer=" + p_layer + " (max=" + (layer_structure.arr.length - 1) + ")"
               + ", returning 0",
-          "Clearance Check",
-          new Point[0]);
+          () -> "Clearance Check",
+          () -> Point.EMPTY);
       return 0;
     }
 
@@ -151,14 +151,14 @@ public class ClearanceMatrix implements Serializable {
     int final_value = p_add_safety_margin ? value_from_the_matrix + clearance_safety_margin : value_from_the_matrix;
 
     FRLogger.trace("ClearanceMatrix.get_value", "clearance_retrieved",
-        "Clearance value: class_i=" + p_i + " (" + (p_i < row.length ? row[p_i].name : "?") + ")"
+        () -> "Clearance value: class_i=" + p_i + " (" + (p_i < row.length ? row[p_i].name : "?") + ")"
             + ", class_j=" + p_j + " (" + (p_j < row.length ? row[p_j].name : "?") + ")"
             + ", layer=" + p_layer + " (" + (p_layer < layer_structure.arr.length ? layer_structure.arr[p_layer].name : "?") + ")"
             + ", base_value=" + value_from_the_matrix + " (" + (value_from_the_matrix / 10000.0) + "mm)"
             + ", safety_margin=" + (p_add_safety_margin ? clearance_safety_margin : 0)
             + ", final_value=" + final_value + " (" + (final_value / 10000.0) + "mm)",
-        "Clearance Check",
-        new Point[0]);
+        () -> "Clearance Check",
+        () -> Point.EMPTY);
 
     return final_value;
   }

@@ -138,7 +138,29 @@ JTextField emailField = new JTextField(globalSettings.userProfileSettings.userEm
     gbc.gridwidth = 4;
     JCheckBox telemetryCheckbox = new JCheckBox(tm.getText("allow_telemetry"));
     telemetryCheckbox.setSelected(globalSettings.userProfileSettings.isTelemetryAllowed);
-    telemetryCheckbox.addItemListener(_ -> globalSettings.userProfileSettings.isTelemetryAllowed = telemetryCheckbox.isSelected());
+    // Withdrawing consent must switch the client off, not merely record a preference. This
+    // listener used to set the flag alone, while the client had been enabled once at startup
+    // and stayed enabled -- so the next identity refresh sent the user's email together with
+    // allow_telemetry=false, and unchecking the box was the act that transmitted it.
+    telemetryCheckbox.addItemListener(_ -> {
+      // Deliberately ASYMMETRIC.
+      //
+      // Withdrawing consent takes effect at once, before anything is saved: the point of
+      // unticking the box is that transmission stops now, and a user who then closes the
+      // dialog without saving has still asked for it to stop.
+      //
+      // Granting consent waits for Save. Applying it here would mean a user who ticks the
+      // box and then dismisses the dialog with the window control -- discarding the change --
+      // has telemetry enabled for the rest of the session while the persisted setting still
+      // says opted out.
+      //
+      // In short: never send more than the user has confirmed, always send less the moment
+      // they ask.
+      if (!telemetryCheckbox.isSelected()) {
+        globalSettings.userProfileSettings.isTelemetryAllowed = false;
+        FRAnalytics.setEnabled(false);
+      }
+    });
     profileDialog.add(telemetryCheckbox, gbc);
 
     // Contacting
@@ -163,6 +185,15 @@ JTextField emailField = new JTextField(globalSettings.userProfileSettings.userEm
     updateButton.addActionListener(new ActionListener() {
       @Override
       public void actionPerformed(ActionEvent e) {
+        // Opt-IN is applied FIRST -- before the identity refresh below, which is gated on
+        // live consent. Applied after it, a freshly-granted consent silently sent nothing:
+        // refreshIdentity() and profileUpdated() ran while the client was still disabled,
+        // and the just-consented profile never left until some unrelated later event.
+        // (Opt-out is not handled here: it already applied the moment the box was unticked.)
+        if (telemetryCheckbox.isSelected()) {
+          globalSettings.userProfileSettings.isTelemetryAllowed = true;
+          FRAnalytics.setEnabled(!globalSettings.usageAndDiagnosticData.disableAnalytics);
+        }
         globalSettings.userProfileSettings.userEmail = emailField.getText();
         FRAnalytics.setUserId(
             globalSettings.userProfileSettings.userId,

@@ -53,6 +53,7 @@ public class IntOctagon extends RegularTileShape implements Serializable {
    * is the intersection of the lower left diagonal boundary line with the x axis. p_urx is the intersection of the upper right diagonal boundary line with the x axis.
    */
   public IntOctagon(int p_lx, int p_ly, int p_rx, int p_uy, int p_ulx, int p_lrx, int p_llx, int p_urx) {
+    app.freerouting.datastructures.AllocationCensus.record("IntOctagon");
     leftX = p_lx;
     bottomY = p_ly;
     rightX = p_rx;
@@ -225,8 +226,61 @@ public class IntOctagon extends RegularTileShape implements Serializable {
     return 8;
   }
 
+  /**
+   * The eight border lines, computed once.
+   *
+   * <p>US-3. Every field of this class is {@code final int}, so a border line cannot change
+   * between calls -- yet {@code border_line} built a fresh {@link Line}, and with it two
+   * {@link IntPoint}s, every single time. That was <b>7.7% of all allocation</b> on bm01,
+   * and the {@code Line} constructor was simultaneously the largest single source of
+   * IntPoint at 7.8%.
+   *
+   * <p>No pool and no representation change: the same objects, created once per octagon
+   * rather than once per question.
+   *
+   * <p>{@code transient} because the cache is derived state -- board deep-copies go through
+   * serialisation, and a copy should rebuild this lazily rather than carry it. {@code
+   * volatile} so the fully-built array is safely published; the worst a race can do is have
+   * two threads build equal arrays and one win, which is harmless because {@link Line} has
+   * final fields and equal contents.
+   *
+   * <p>All eight are built together even when a caller wants one, because the callers that
+   * matter loop over every border ({@code CalcFromSide}, {@code to_Simplex}) and one of them
+   * asks for the same index twice within a single expression.
+   */
+  private transient volatile Line[] cached_border_lines;
+
   @Override
   public Line border_line(int p_no) {
+    // Range-checked HERE so the contract is unchanged: indexing the array directly would
+    // throw ArrayIndexOutOfBoundsException, silently changing the exception type callers
+    // have always seen.
+    if (p_no < 0 || p_no >= 8) {
+      throw new IllegalArgumentException("IntOctagon.edge_line: p_no out of range");
+    }
+    // PER INDEX, and that is not a detail. Building all eight up front constructs border
+    // lines the caller never asked for, and for extreme octagons some of those lie outside
+    // the exact coordinate range -- the invariant guard fired with
+    // "Coordinate outside the exact range: (-33554433, 1)" on five routing fixtures. The
+    // engine never builds those lines because it never asks for them, so neither may a
+    // cache. Only the requested line is computed, exactly as before; it is merely kept.
+    Line[] lines = cached_border_lines;
+    if (lines == null) {
+      lines = new Line[8];
+      cached_border_lines = lines;
+    }
+    Line line = lines[p_no];
+    if (line == null) {
+      line = computeBorderLine(p_no);
+      // Benign race: two threads may compute the same index and produce equal Lines, and
+      // either may win. Line has final fields, so whichever reference is published is
+      // fully constructed.
+      lines[p_no] = line;
+    }
+    return line;
+  }
+
+  private Line computeBorderLine(int p_no) {
     int a_x;
     int a_y;
     int b_x;
@@ -507,6 +561,21 @@ public class IntOctagon extends RegularTileShape implements Serializable {
     }
     if (new_lx > new_rx || new_ly > new_uy || new_llx > new_urx || new_ulx > new_lrx) {
       return EMPTY;
+    }
+    if (new_lx == leftX
+        && new_ly == bottomY
+        && new_rx == rightX
+        && new_uy == topY
+        && new_ulx == upperLeftDiagonalX
+        && new_lrx == lowerRightDiagonalX
+        && new_llx == lowerLeftDiagonalX
+        && new_urx == upperRightDiagonalX) {
+      // Already normalised: none of the constraints above moved a coordinate. This
+      // class is immutable and nothing compares shapes by identity, so returning this
+      // instance is indistinguishable from returning an equal new one -- and shapes are
+      // normalised repeatedly while expansion rooms are built, so the no-op case is the
+      // common one.
+      return this;
     }
     return new IntOctagon(new_lx, new_ly, new_rx, new_uy, new_ulx, new_lrx, new_llx, new_urx);
   }

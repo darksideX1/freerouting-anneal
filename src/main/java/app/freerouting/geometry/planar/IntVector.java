@@ -22,6 +22,7 @@ public class IntVector extends Vector implements Serializable {
    * creates an IntVector from two integer coordinates
    */
   public IntVector(int p_x, int p_y) {
+    app.freerouting.datastructures.AllocationCensus.record("IntVector");
     // range check omitted for performance reasons
     x = p_x;
     y = p_y;

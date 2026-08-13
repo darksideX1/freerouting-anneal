@@ -246,7 +246,7 @@ The optimizer is the "make it better" stage. It runs after routing is already co
 
 - Measure the result.
 
-    The new route is compared with the old one using metrics such as trace length and via count. In multi-threaded mode, several candidates may be tried and the best one wins.
+    The new route is compared with the old one using metrics such as trace length and via count. (Multi-threaded optimisation parallelises WHICH items are being tried — workers share one master board and accepted improvements compound. It is not candidate racing; racing is a separate, opt-in ROUTING mode.)
 
 - Keep the improvement or undo it.
 

@@ -3,6 +3,7 @@ package app.freerouting.interactive;
 import static app.freerouting.Freerouting.globalSettings;
 
 import app.freerouting.autoroute.BatchAutorouter;
+import app.freerouting.autoroute.BatchRoutingAlgorithm;
 import app.freerouting.autoroute.BatchAutorouterV19;
 import app.freerouting.autoroute.BatchOptimizer;
 import app.freerouting.autoroute.BatchOptimizerMultiThreaded;
@@ -263,6 +264,11 @@ public class AutorouterAndRouteOptimizerThread extends InteractiveActionThread {
           TextManager tm = new TextManager(InteractiveState.class, boardManager.get_locale());
           String start_message = tm.getText("autorouter_started", Integer.toString(event.getPassNumber()));
           boardManager.screen_messages.set_status_message(start_message);
+          boardManager.screen_messages.start_routing_clock(
+              app.freerouting.util.TextManager.parseTimespanString(
+                  routingJob.routerSettings.jobTimeoutString));
+        } else {
+          boardManager.screen_messages.stop_routing_clock();
         }
       }
     });
@@ -270,7 +276,10 @@ public class AutorouterAndRouteOptimizerThread extends InteractiveActionThread {
     this.batchOptimizer = null;
 
     if (routingJob.routerSettings.optimizer.enabled) {
-      if ((!globalSettings.featureFlags.multiThreading) || (routingJob.routerSettings.optimizer.maxThreads == 1)) {
+      // featureFlags.multiThreading is the GUI-side kill switch (headless is governed by
+      // the width setting alone). The helper is null-safe and ceiling-aware.
+      if ((!globalSettings.featureFlags.multiThreading)
+          || !app.freerouting.autoroute.BatchOptimizerMultiThreaded.shouldUseMultiThreaded(routingJob)) {
         // Single-threaded route optimization
         this.batchOptimizer = new BatchOptimizer(routingJob);
 
@@ -309,7 +318,13 @@ public class AutorouterAndRouteOptimizerThread extends InteractiveActionThread {
         });
       }
 
-      if ((globalSettings.featureFlags.multiThreading) && (routingJob.routerSettings.optimizer.maxThreads > 1)) {
+      // The multi-threaded optimizer is shipped, governed behaviour -- it delivers
+      // its wins, compounds within a pass, stops honestly (work-quanta guard) and lives
+      // inside the memory budget. Width defaults to 2, the measured quality point. The
+      // 1.0.3 freeze (which existed because the old implementation discarded every win it
+      // found) is lifted.
+      if ((globalSettings.featureFlags.multiThreading)
+          && app.freerouting.autoroute.BatchOptimizerMultiThreaded.shouldUseMultiThreaded(routingJob)) {
         // Multi-threaded route optimization
         this.batchOptimizer = new BatchOptimizerMultiThreaded(routingJob);
 
@@ -530,6 +545,21 @@ public class AutorouterAndRouteOptimizerThread extends InteractiveActionThread {
         }
       }
 
+      // The headless scheduler consults this; the GUI driver did not, so the
+      // partial-board protection existed only for one of the two paths that construct
+      // these engines. An aborted pass must not be optimized here either.
+      // batchAutorouter is declared as NamedAlgorithm here, so ask through the routing
+      // interface that actually carries the outcome -- the same narrowing this method
+      // already does to reach runBatchLoop().
+      final boolean routingEndedAbnormally =
+          (batchAutorouter instanceof BatchRoutingAlgorithm routingAlgorithm)
+              && routingAlgorithm.endedAbnormally();
+      if (routingEndedAbnormally) {
+        routingJob.logError("The routing pass was aborted; skipping optimization, because "
+            + "the board in memory is partially routed and optimizing it would write that "
+            + "over the last good result.", null);
+      }
+
       boardManager.replaceRoutingBoard(routingJob.board);
 
       boardManager
@@ -594,14 +624,16 @@ public class AutorouterAndRouteOptimizerThread extends InteractiveActionThread {
       Thread.sleep(100);
 
       // Let's run the optimizer if it's enabled
-      int num_threads = boardManager.get_num_threads();
-      if ((num_threads > 0) && (routingJob.routerSettings.optimizer.enabled)) {
+      // 1.1.1: the optimisation gate reads the OPTIMISER's own settings. It used to be
+      // gated on the ROUTER thread count (the racing knob) and printed a 1.0.3-era
+      // warning that multi-threaded optimisation is broken -- both false for this
+      // release and both contradicting the shipped defaults.
+      Integer optimizerWidthSetting = routingJob.routerSettings.optimizer.maxThreads;
+      int optimizerWidth = optimizerWidthSetting == null ? 2 : optimizerWidthSetting;
+      if (routingJob.routerSettings.optimizer.enabled
+          && !routingEndedAbnormally) {
         routingJob
-            .logInfo("Starting optimization on " + (num_threads == 1 ? "1 thread" : num_threads + " threads") + "...");
-        if (num_threads > 1) {
-          routingJob.logWarning(
-              "Multi-threaded route optimization is broken and it is known to generate clearance violations. It is highly recommended to use the single-threaded route optimization instead by setting the number of threads to 1 with the '-mt 1' command line argument.");
-        }
+            .logInfo("Starting optimization on " + (optimizerWidth == 1 ? "1 thread" : optimizerWidth + " threads") + "...");
 
         FRLogger.traceEntry("BatchAutorouterThread.thread_action()-routeoptimization");
         FRAnalytics.routeOptimizerStarted();
@@ -674,6 +706,11 @@ public class AutorouterAndRouteOptimizerThread extends InteractiveActionThread {
           .incomplete_count();
       String end_message = tm.getText("autoroute_end_message", curr_message, Integer.toString(incomplete_count));
       boardManager.screen_messages.set_status_message(end_message);
+
+      // The finishing dialog (spec: docs/fork/FINAL-REPORT-SPEC.md section 2): the
+      // counts a user needs to judge the run, and one click to the report file that
+      // carries the per-pin unrouted list. Deliberately a plain dialog.
+      showFinalReportDialog();
 
       // Refresh the windows
       boardManager.get_panel().board_frame.refresh_windows();
@@ -820,4 +857,77 @@ public class AutorouterAndRouteOptimizerThread extends InteractiveActionThread {
       }
     }
   }
+  /**
+   * The finishing dialog: why the run ended, the gap (routed of total), and one click to
+   * the report file. English on purpose, like the optimizer help surface -- it changes
+   * with the code, and a stale translation of a count label is worse than an
+   * untranslated truth. Never a dead button: opening degrades from the desktop opener to
+   * showing the selectable path (spec, operator-answered ladder).
+   */
+  private void showFinalReportDialog() {
+    try {
+      app.freerouting.board.RoutingBoard finalBoard = boardManager.get_routing_board();
+      String ending = app.freerouting.Freerouting.endingMessage(routingJob);
+      if (ending == null) {
+        ending = this.isStopRequested() ? "Stopped on request." : "Finished.";
+      }
+      var stats = new app.freerouting.core.scoring.BoardStatistics(finalBoard);
+      final java.nio.file.Path reportPath =
+          app.freerouting.core.FinalRunReport.write(routingJob, finalBoard, ending, stats);
+      Integer total = stats.connections.maximumCount;
+      Integer unrouted = stats.connections.incompleteCount;
+      Integer violations = stats.clearanceViolations == null ? null : stats.clearanceViolations.totalCount;
+
+      StringBuilder body = new StringBuilder(ending).append("\n\n");
+      if (total != null && unrouted != null) {
+        body.append("Routed:      ").append(total - unrouted).append(" of ").append(total)
+            .append(" connections\n");
+        body.append("Unrouted:    ").append(unrouted).append("\n");
+      }
+      if (violations != null) {
+        body.append("Violations:  ").append(violations).append("\n");
+      }
+      final String message = body.toString();
+
+      javax.swing.SwingUtilities.invokeLater(() -> {
+        try {
+        Object[] options = reportPath != null
+            ? new Object[] {"Open report", "OK"}
+            : new Object[] {"OK"};
+        int choice = javax.swing.JOptionPane.showOptionDialog(
+            boardManager.get_panel(), message, "Routing finished",
+            javax.swing.JOptionPane.DEFAULT_OPTION, javax.swing.JOptionPane.INFORMATION_MESSAGE,
+            null, options, options[options.length - 1]);
+        if (reportPath != null && choice == 0) {
+          openReport(reportPath);
+        }
+        } catch (Exception e) {
+          // The surrounding try lives on the routing thread; this body runs on the EDT
+          // and needs its own net, or a dialog failure escapes unlogged.
+          routingJob.logError("Finishing dialog failed on the EDT", e);
+        }
+      });
+    } catch (Exception e) {
+      // The dialog is a convenience; its failure must never damage the finished run.
+      routingJob.logError("Could not show the finishing dialog", e);
+    }
+  }
+
+  /** Rung 1: the desktop opens it. Rung 3: the path, selectable, so nobody is stranded. */
+  private void openReport(java.nio.file.Path reportPath) {
+    try {
+      if (java.awt.Desktop.isDesktopSupported()
+          && java.awt.Desktop.getDesktop().isSupported(java.awt.Desktop.Action.OPEN)) {
+        java.awt.Desktop.getDesktop().open(reportPath.toFile());
+        return;
+      }
+    } catch (Exception e) {
+      routingJob.logWarning("Could not open the report with the system opener: " + e.getMessage());
+    }
+    javax.swing.JTextField pathField = new javax.swing.JTextField(reportPath.toString());
+    pathField.setEditable(false);
+    javax.swing.JOptionPane.showMessageDialog(boardManager.get_panel(), pathField,
+        "The report is at", javax.swing.JOptionPane.INFORMATION_MESSAGE);
+  }
+
 }

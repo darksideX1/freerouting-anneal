@@ -31,6 +31,32 @@ public class BatchFanout {
   private int extraViasTotal;
   public int totalItemsFanouted = 0;
   private Long deadlineMs = null;
+
+  /**
+   * How far inside the job's deadline this stage aims to finish.
+   *
+   * <p>Matches the optimizer's grace for the same reason: the watchdog that enforces the job
+   * deadline ticks once a second, so a stage aiming to land exactly on it races that tick and
+   * gets cut off mid-pass instead of finishing by choice.
+   */
+  static final long STAGE_DEADLINE_GRACE_MS = 5_000L;
+
+  /**
+   * The instant fanout should stop, given its own optional timeout and the job's.
+   *
+   * <p>Fanout previously honoured only {@code router.fanout.timeout}, which ships unset -- so
+   * by default it had no deadline at all and never consulted the job. A three minute job
+   * timeout with a stage running past it defeats the point of having an envelope, and the
+   * optimizer already derives its deadline this way; fanout was the stage outside the rule.
+   *
+   * <p>An explicit stage timeout is honoured only while it fits: it can shorten the stage, it
+   * can never extend it past the job.
+   */
+  static Long computeFanoutDeadlineMs(Long p_explicitTimeoutSeconds, Long p_jobDeadlineMs,
+      long p_nowMs) {
+    // Delegates: every stage stops by the same rule, and one copy cannot drift from another.
+    return StageDeadline.compute(p_explicitTimeoutSeconds, p_jobDeadlineMs, p_nowMs);
+  }
   private boolean isTimedOut = false;
 
   private BatchFanout(RoutingBoard p_board, RouterSettings p_settings, StoppableThread p_thread) {
@@ -82,14 +108,21 @@ public class BatchFanout {
   public static FanoutRunSummary fanout_board(RoutingBoard p_board, RouterSettings p_settings,
       StoppableThread p_thread,
       FanoutProgressListener progressListener) {
+    return fanout_board(p_board, p_settings, p_thread, progressListener, null);
+  }
+
+  public static FanoutRunSummary fanout_board(RoutingBoard p_board, RouterSettings p_settings,
+      StoppableThread p_thread,
+      FanoutProgressListener progressListener, Long p_jobDeadlineMs) {
     BatchFanout fanout_instance = new BatchFanout(p_board, p_settings, p_thread);
     long fanoutStart = System.currentTimeMillis();
+    Long explicitTimeoutSeconds = null;
     if (p_settings.fanout != null && p_settings.fanout.timeoutString != null) {
-      Long timeoutSeconds = app.freerouting.util.TextManager.parseTimespanString(p_settings.fanout.timeoutString);
-      if (timeoutSeconds != null) {
-        fanout_instance.deadlineMs = fanoutStart + timeoutSeconds * 1000;
-      }
+      explicitTimeoutSeconds =
+          app.freerouting.util.TextManager.parseTimespanString(p_settings.fanout.timeoutString);
     }
+    fanout_instance.deadlineMs =
+        computeFanoutDeadlineMs(explicitTimeoutSeconds, p_jobDeadlineMs, fanoutStart);
     int maxPasses = (p_settings.fanout != null && p_settings.fanout.maxPasses != null)
         ? p_settings.fanout.maxPasses : 20;
     final int STAGNATION_PASS_LIMIT = 3;
@@ -162,13 +195,13 @@ public class BatchFanout {
     int effectiveRipupCosts = ripupAllowed ? ripup_costs : -1;
 
     FRLogger.trace("BatchFanout.fanout_pass", "pass_start",
-        "pass=" + (p_pass_no + 1)
+        () -> "pass=" + (p_pass_no + 1)
             + ", totalPins=" + this.totalSmdPinCount
             + ", alreadyConnected=" + this.alreadyConnectedPinCount
             + ", pinsToFanout=" + (this.totalSmdPinCount - this.alreadyConnectedPinCount)
             + ", ripupCosts=" + effectiveRipupCosts
             + ", baseMillisPerPin=" + baseMillisPerPin,
-        "", new app.freerouting.geometry.planar.Point[0]);
+        () -> "", () -> app.freerouting.geometry.planar.Point.EMPTY);
 
     this.progressThrottler.reset();
     BoardStatistics progressStats = new BoardStatistics(this.routing_board, null, false);
@@ -196,20 +229,22 @@ public class BatchFanout {
           boolean fallbackAllowed = this.settings.fanout != null && Boolean.TRUE.equals(this.settings.fanout.fallbackToBoardVias) && hasBoardVias;
           boolean canUseVias = (viaRule != null && viaRule.via_count() > 0) || fallbackAllowed;
           if (!canUseVias) {
-            FRLogger.debug("BatchFanout: skipping pin " + fullPinName + " because its net class has no vias defined and fallback is disabled/unavailable.");
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug("BatchFanout: skipping pin " + fullPinName + " because its net class has no vias defined and fallback is disabled/unavailable.");
+            }
             --pinsToGo;
             continue;
           }
         }
 
         FRLogger.trace("BatchFanout.fanout_pass", "pin_start",
-            "pin=" + fullPinName
+            () -> "pin=" + fullPinName
                 + ", net=" + netNo
                 + ", targetCount=" + targetCount
                 + ", center=" + curr_pin.board_pin.get_center()
                 + ", layer=" + curr_pin.board_pin.first_layer()
                 + ", pass=" + (p_pass_no + 1),
-            fullPinName, new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
+            () -> fullPinName, () -> new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
 
         this.routing_board.start_marking_changed_area();
         long pinStartNanos = System.nanoTime();
@@ -227,59 +262,59 @@ public class BatchFanout {
              ++routed_count;
              this.totalItemsFanouted++;
              FRLogger.trace("BatchFanout.fanout_pass", "pin_routed",
-                 "pin=" + fullPinName
+                 () -> "pin=" + fullPinName
                      + ", net=" + netNo
                      + ", durationMs=" + pinDurationMs
                      + ", targetCount=" + targetCount,
-                 fullPinName, new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
+                 () -> fullPinName, () -> new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
           }
           case ALREADY_CONNECTED -> {
             ++already_connected_count;
             FRLogger.trace("BatchFanout.fanout_pass", "pin_already_connected",
-                "pin=" + fullPinName
+                () -> "pin=" + fullPinName
                     + ", net=" + netNo
                     + ", targetCount=" + targetCount
                     + ", detail=" + curr_result.details,
-                fullPinName, new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
+                () -> fullPinName, () -> new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
           }
           case FAILED       -> {
             ++not_routed_count;
             this.totalItemsFanouted++;
             FRLogger.trace("BatchFanout.fanout_pass", "pin_failed",
-                "pin=" + fullPinName
+                () -> "pin=" + fullPinName
                     + ", net=" + netNo
                     + ", targetCount=" + targetCount
                     + ", durationMs=" + pinDurationMs
                     + ", detail=" + (curr_result.details == null || curr_result.details.isEmpty()
                     ? "no detail"
                     : curr_result.details),
-                fullPinName, new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
+                () -> fullPinName, () -> new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
           }
           case INSERT_ERROR -> {
             ++insert_error_count;
             this.totalItemsFanouted++;
             FRLogger.trace("BatchFanout.fanout_pass", "pin_insert_error",
-                "pin=" + fullPinName
+                () -> "pin=" + fullPinName
                     + ", net=" + netNo
                     + ", detail=" + (curr_result.details == null || curr_result.details.isEmpty()
                     ? "no detail"
                     : curr_result.details),
-                fullPinName, new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
+                () -> fullPinName, () -> new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
           }
           case NO_UNCONNECTED_NETS -> {
             FRLogger.trace("BatchFanout.fanout_pass", "pin_no_unconnected_nets",
-                "pin=" + fullPinName
+                () -> "pin=" + fullPinName
                     + ", net=" + netNo
                     + ", detail=" + curr_result.details,
-                fullPinName, new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
+                () -> fullPinName, () -> new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
           }
           default -> {
             FRLogger.trace("BatchFanout.fanout_pass", "pin_other_state",
-                "pin=" + fullPinName
+                () -> "pin=" + fullPinName
                     + ", net=" + netNo
                     + ", state=" + curr_result.state
                     + ", detail=" + curr_result.details,
-                fullPinName, new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
+                () -> fullPinName, () -> new app.freerouting.geometry.planar.Point[]{curr_pin.board_pin.get_center()});
           }
         }
         --pinsToGo;
@@ -313,17 +348,21 @@ public class BatchFanout {
     EscapeStatistics escapeStats = EscapeStatistics.fromBoardStatistics(passStats);
 
     long passDurationMs = System.currentTimeMillis() - passStart;
+    final int routedCount = routed_count;
+    final int notRoutedCount = not_routed_count;
+    final int insertErrorCount = insert_error_count;
+    final int alreadyConnectedCount = already_connected_count;
     FRLogger.trace("BatchFanout.fanout_pass", "pass_end",
-        "pass=" + (p_pass_no + 1)
+        () -> "pass=" + (p_pass_no + 1)
             + ", durationMs=" + passDurationMs
-            + ", routed=" + routed_count
-            + ", notRouted=" + not_routed_count
-            + ", insertErrors=" + insert_error_count
-            + ", alreadyConnected=" + already_connected_count
+            + ", routed=" + routedCount
+            + ", notRouted=" + notRoutedCount
+            + ", insertErrors=" + insertErrorCount
+            + ", alreadyConnected=" + alreadyConnectedCount
             + ", escaped=" + escapeStats.escapedCount()
             + "/" + escapeStats.totalSmdPins()
             + " (" + String.format("%.1f", escapeStats.escapedPercentage()) + "%)",
-        "", new app.freerouting.geometry.planar.Point[0]);
+        () -> "", () -> app.freerouting.geometry.planar.Point.EMPTY);
 
     if (progressListener == null) {
       FRLogger.info(

@@ -1,9 +1,20 @@
 // -----------------------------------------------------------------------------
 // publishing information
 // -----------------------------------------------------------------------------
-ext.publishInfo.artifactId = project.name.toLowerCase()
+// Freerouting-Anneal: a fork of Freerouting 2.3.1, distributed under its own name so
+// its version numbers can never collide with upstream's. Set explicitly rather than
+// derived from project.name, which also drives build paths.
+ext.publishInfo.artifactId = 'freerouting-anneal'
 ext.publishInfo.groupId = 'app.freerouting'
-ext.publishInfo.versionId = '2.3.1-SNAPSHOT'
+// This artifact's history starts here, so its version does too.
+//
+// 3.0.0 was right while we were still called freerouting -- it said 'ahead of 2.3.1' in
+// upstream's own sequence, and 2.3.2 would have filed a changed routing result under
+// 'patch'. Under our own name that sequence is meaningless: there is no 2.x of
+// Freerouting-Anneal, and a first release numbered 3.0.0 only invites 'where are 1 and 2'.
+// Lineage is a fact about where we came from and belongs in the description, not in a
+// field whose job is ordering this artifact against its own past.
+ext.publishInfo.versionId = '1.1.1'
 ext.publishInfo.isReleaseVersion = !ext.publishInfo.versionId.endsWith("SNAPSHOT")
 
 ext.publishInfo.developerName = 'Andras Fuchs, Michael Hoffer, Andrey Belomutskiy, Alfons Wirtz'
@@ -11,7 +22,7 @@ ext.publishInfo.developerAlias = 'freerouting'
 ext.publishInfo.developerEmail = 'info@freerouting.app'
 ext.publishInfo.inceptionYear = '2004'
 
-ext.publishInfo.desc = 'Advanced PCB Autorouter'
+ext.publishInfo.desc = 'Advanced PCB Autorouter -- a fork of Freerouting 2.3.1'
 ext.publishInfo.license = 'GPL-3.0'
 ext.publishInfo.licenseUrl = 'https://github.com/freerouting/freerouting/blob/master/LICENSE.txt'
 ext.publishInfo.labels = ['PCB', 'autorouter', 'KiCad', 'EAGLE', 'router', 'routing', 'routing-engine', 'dsn', 'autoroute', 'auto-router', 'pcb-design', 'specctra']

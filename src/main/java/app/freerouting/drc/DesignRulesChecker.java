@@ -204,11 +204,11 @@ public class DesignRulesChecker {
     Collection<ClearanceViolation> violations = getAllClearanceViolations();
 
     FRLogger.trace("DesignRulesChecker.generateReport", "drc_check_started",
-        "DRC check started: total_clearance_violations=" + violations.size()
+        () -> "DRC check started: total_clearance_violations=" + violations.size()
             + ", coordinate_unit=" + coordinateUnit
             + ", source_file=" + sourceFile,
-        "DRC Check",
-        new Point[0]);
+        () -> "DRC Check",
+        () -> Point.EMPTY);
 
     // Convert internal violations to DRC report format
     for (ClearanceViolation violation : violations) {
@@ -216,24 +216,24 @@ public class DesignRulesChecker {
       report.addViolation(drcViolation);
 
       FRLogger.trace("DesignRulesChecker.generateReport", "drc_violation",
-          "DRC violation: type=clearance"
+          () -> "DRC violation: type=clearance"
               + ", item1=" + violation.first_item.toString()
               + ", item2=" + violation.second_item.toString()
               + ", layer=" + violation.layer
               + ", expected=" + (violation.expected_clearance / 10000.0) + "mm"
               + ", actual=" + (violation.actual_clearance / 10000.0) + "mm"
               + ", delta=" + ((violation.expected_clearance - violation.actual_clearance) / 10000.0) + "mm",
-          "DRC Check",
-          new Point[] { violation.shape.centre_of_gravity().round() });
+          () -> "DRC Check",
+          () -> new Point[] { violation.shape.centre_of_gravity().round() });
     }
 
     // Get all unconnected items
     Collection<UnconnectedItems> unconnectedItems = getAllUnconnectedItems();
 
     FRLogger.trace("DesignRulesChecker.generateReport", "unconnected_items",
-        "Unconnected items found: count=" + unconnectedItems.size(),
-        "DRC Check",
-        new Point[0]);
+        () -> "Unconnected items found: count=" + unconnectedItems.size(),
+        () -> "DRC Check",
+        () -> Point.EMPTY);
 
     // Convert unconnected items to DRC report format
     for (UnconnectedItems unconnectedItem : unconnectedItems) {
@@ -246,10 +246,10 @@ public class DesignRulesChecker {
     }
 
     FRLogger.trace("DesignRulesChecker.generateReport", "drc_check_completed",
-        "DRC check completed: total_violations=" + report.violations.size()
+        () -> "DRC check completed: total_violations=" + report.violations.size()
             + ", total_unconnected=" + report.unconnected_items.size(),
-        "DRC Check",
-        new Point[0]);
+        () -> "DRC Check",
+        () -> Point.EMPTY);
 
     return report;
   }
@@ -541,12 +541,12 @@ public class DesignRulesChecker {
         .mapToInt(Collection::size)
         .sum();
     FRLogger.trace("DesignRulesChecker.calculateAllIncompletes", "max_connections",
-        "Calculated max_connections=" + this.max_connections
+        () -> "Calculated max_connections=" + this.max_connections
             + ", total_items=" + totalItems
             + ", net_count=" + net_item_lists.size()
             + " (formula: total_items - net_count)",
-        "Incomplete Count",
-        new Point[0]);
+        () -> "Incomplete Count",
+        () -> Point.EMPTY);
 
     int[] focusNets = new int[] {98, 99};
     for (int netNo : focusNets) {
@@ -555,9 +555,9 @@ public class DesignRulesChecker {
         Net net = board.rules.nets.get(netNo);
         String netName = net != null ? net.name : "unknown";
         FRLogger.trace("DesignRulesChecker.calculateAllIncompletes", "net_item_count",
-            "Net item count: net=" + netNo + ", name=" + netName + ", items=" + netItems,
-            "Net #" + netNo + " (" + netName + ")",
-            new Point[0]);
+            () -> "Net item count: net=" + netNo + ", name=" + netName + ", items=" + netItems,
+            () -> "Net #" + netNo + " (" + netName + ")",
+            () -> Point.EMPTY);
 
         // Let's validate all the polyline traces for this net
         var net_items = net_item_lists.get(netNo - 1);
@@ -624,7 +624,6 @@ public class DesignRulesChecker {
     }
 
     int result = 0;
-    StringBuilder detailsBuilder = new StringBuilder();
     int netsWithIncompletes = 0;
 
     for (int i = 0; i < net_incompletes.length; i++) {
@@ -632,23 +631,40 @@ public class DesignRulesChecker {
       if (netIncompletes > 0) {
         result += netIncompletes;
         netsWithIncompletes++;
-        if (netsWithIncompletes <= 10) { // Log first 10 nets with incompletes
-          Net net = board.rules.nets.get(i + 1);
-          String netName = net != null ? net.name : "unknown";
-          detailsBuilder.append("Net #").append(i + 1).append(" (").append(netName).append("): ")
-              .append(netIncompletes).append(" incomplete(s); ");
-        }
       }
     }
 
+    // The per-net breakdown used to be built by this loop on every call, into a
+    // StringBuilder, for a message that is discarded at the default level. It is a summary
+    // of an array that is still sitting right there, so it is cheaper to walk again on the
+    // rare occasion somebody reads it than to build it every time nobody does.
+    final int totalIncompletes = result;
+    final int netsWithAny = netsWithIncompletes;
     FRLogger.trace("DesignRulesChecker.getIncompleteCount", "total_incompletes_calculated",
-        "Total incomplete count: " + result
-            + ", nets_with_incompletes=" + netsWithIncompletes
-            + ", first_few_nets=" + detailsBuilder.toString(),
-        "Incomplete Count",
-        new Point[0]);
+        () -> "Total incomplete count: " + totalIncompletes
+            + ", nets_with_incompletes=" + netsWithAny
+            + ", first_few_nets=" + describeFirstNetsWithIncompletes(10),
+        () -> "Incomplete Count",
+        () -> Point.EMPTY);
 
     return result;
+  }
+
+  /** Renders the first {@code limit} nets that still have incomplete connections. */
+  private String describeFirstNetsWithIncompletes(int limit) {
+    StringBuilder details = new StringBuilder();
+    int shown = 0;
+    for (int i = 0; i < net_incompletes.length && shown < limit; i++) {
+      int netIncompletes = net_incompletes[i].count();
+      if (netIncompletes > 0) {
+        Net net = board.rules.nets.get(i + 1);
+        String netName = net != null ? net.name : "unknown";
+        details.append("Net #").append(i + 1).append(" (").append(netName).append("): ")
+            .append(netIncompletes).append(" incomplete(s); ");
+        shown++;
+      }
+    }
+    return details.toString();
   }
 
   /**
@@ -667,11 +683,11 @@ public class DesignRulesChecker {
     String netName = net != null ? net.name : "unknown";
 
     FRLogger.trace("DesignRulesChecker.getIncompleteCount", "net_incomplete_count",
-        "Net incomplete count: net=" + netNo
+        () -> "Net incomplete count: net=" + netNo
             + ", name=" + netName
             + ", incomplete_count=" + result,
-        "Net #" + netNo + " (" + netName + ")",
-        new Point[0]);
+        () -> "Net #" + netNo + " (" + netName + ")",
+        () -> Point.EMPTY);
 
     return result;
   }

@@ -158,7 +158,11 @@ def _build_board_json_manually(board):
         "nets": [],
         "clearanceRules": [],
         "components": [],
-        "outline": {"corners": [], "clearance": 0.5},
+        # 0.0 means "no declared edge clearance" and the reader keeps its default
+        # behaviour. Do NOT restore a non-zero placeholder here: the reader now
+        # honours this value, so a placeholder would impose an edge clearance the
+        # user never asked for (upstream issue #558).
+        "outline": {"corners": [], "clearance": 0.0},
         "traces": [],
         "vias": [],
         "conductionAreas": [],
@@ -617,8 +621,37 @@ def _collect_conduction_areas(board, data, layer_id_to_index):
         logger.warning(f"Warning: could not enumerate conduction areas: {e}", exc_info=True)
 
 
+def _collect_outline_clearance(board, data):
+    """Read KiCad's declared copper-to-edge clearance into ``data["outline"]["clearance"]``.
+
+    Upstream issue #558. KiCad exposes this as ``m_CopperEdgeClearance`` on the design
+    settings (KiCad 8+). It was previously never read, so a user who set 0.5 mm in
+    KiCad got traces placed at the conductor-to-conductor clearance from the board
+    edge and KiCad's own DRC then failed a board Freerouting had reported as clean.
+
+    Leaves the value at 0.0 when KiCad does not expose the field. 0.0 means "not
+    declared" to the reader, which preserves the previous behaviour -- guessing a
+    value here would apply an edge clearance the board never asked for.
+    """
+    try:
+        settings = board.GetDesignSettings() if hasattr(board, "GetDesignSettings") else None
+        if settings is None or not hasattr(settings, "m_CopperEdgeClearance"):
+            debug_log("KiCad did not expose m_CopperEdgeClearance; leaving it undeclared.")
+            return
+        edge_mm = pcbnew.ToMM(settings.m_CopperEdgeClearance)
+        if edge_mm and edge_mm > 0:
+            data["outline"]["clearance"] = edge_mm
+            debug_log(f"Copper-to-edge clearance read from KiCad: {edge_mm} mm")
+        else:
+            debug_log("KiCad reports no copper-to-edge clearance; leaving it undeclared.")
+    except Exception as e:
+        # Never fail the export over a design-rule read; the board still routes.
+        debug_log(f"Could not read copper-to-edge clearance: {e}")
+
+
 def _collect_outline(board, data):
     """Populate ``data["outline"]`` from Edge.Cuts drawings."""
+    _collect_outline_clearance(board, data)
     global _debug_logs
     try:
         # 1. Try using the native GetBoardPolygonOutlines method if available (KiCad 6+)

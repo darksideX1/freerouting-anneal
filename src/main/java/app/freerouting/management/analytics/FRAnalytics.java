@@ -115,7 +115,7 @@ public class FRAnalytics {
   }
 
   private static void identifyUser(String userId, Map<String, String> traits) {
-    if (analytics == null) {
+    if (analytics == null || !consentGivenNow()) {
       return;
     }
 
@@ -130,7 +130,7 @@ public class FRAnalytics {
   }
 
   private static void identifyAnonymous(String anonymousId, Map<String, String> traits) {
-    if (analytics == null) {
+    if (analytics == null || !consentGivenNow()) {
       return;
     }
 
@@ -145,7 +145,7 @@ public class FRAnalytics {
   }
 
   private static void trackAnonymousAction(String anonymousId, String action, Map<String, String> properties) {
-    if (analytics == null) {
+    if (analytics == null || !consentGivenNow()) {
       return;
     }
 
@@ -174,6 +174,38 @@ public class FRAnalytics {
     } catch (Exception e) {
       FRLogger.error("Exception in FRAnalytics.trackAnonymousAction: " + e.getMessage(), e);
     }
+  }
+
+  /**
+   * May anything be sent right now?
+   *
+   * <p>Consent used to be read once, at startup, into a flag that decided whether the
+   * analytics client was constructed. Unchecking the telemetry box mid-session therefore
+   * changed a setting and nothing else: the client stayed alive, and the very next
+   * {@code refreshIdentity()} transmitted the user's email address together with
+   * {@code allow_telemetry=false}. Withdrawing consent was the act that sent the email, and
+   * consent was not honoured until the application was restarted.
+   *
+   * <p>So it is read live, immediately before every send, and never cached.
+   *
+   * <p>Unknown consent counts as withheld. The field defaults to true so null should not
+   * occur, but if it ever does, not sending is the failure worth having.
+   */
+  static boolean sendingAllowed(Boolean p_analytics_disabled, Boolean p_telemetry_allowed) {
+    if (Boolean.TRUE.equals(p_analytics_disabled)) {
+      return false;
+    }
+    return Boolean.TRUE.equals(p_telemetry_allowed);
+  }
+
+  /** Live consent, straight from settings, for the current send. */
+  private static boolean consentGivenNow() {
+    if (globalSettings == null || globalSettings.userProfileSettings == null
+        || globalSettings.usageAndDiagnosticData == null) {
+      return false;
+    }
+    return sendingAllowed(globalSettings.usageAndDiagnosticData.disableAnalytics,
+        globalSettings.userProfileSettings.isTelemetryAllowed);
   }
 
   private static boolean isEventTrackingEnabled(String action) {
@@ -262,6 +294,11 @@ public class FRAnalytics {
     }
   }
 
+  /**
+   * Deliberately NOT gated on consent. This is the call that turns the client off, so
+   * refusing to run it when consent has been withdrawn would leave the client enabled --
+   * the exact failure this change exists to fix.
+   */
   public static void setEnabled(boolean enabled) {
     if (analytics == null) {
       return;

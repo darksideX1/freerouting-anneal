@@ -351,15 +351,17 @@ public class MazeSearchAlgo {
     int doorCountBeforeCompletion = p_list_element.next_room.get_doors().size();
     this.autoroute_engine.complete_neighbour_rooms(p_list_element.next_room);
     int doorCountAfterCompletion = p_list_element.next_room.get_doors().size();
-    FRLogger.trace("ROOM_COMPLETE_SYNC"
-        + ", net=" + ctrl.net_no
-        + ", layer=" + layer_no
-        + ", from_section=" + p_list_element.section_no_of_door
-        + ", backtrack_section=" + p_list_element.section_no_of_backtrack_door
-        + ", from_door=" + describe_expandable(p_list_element.door)
-        + ", next_room=" + describe_room(p_list_element.next_room)
-        + ", door_count_before=" + doorCountBeforeCompletion
-        + ", door_count_after=" + doorCountAfterCompletion);
+    if (FRLogger.isTraceEnabled()) {
+      FRLogger.trace("ROOM_COMPLETE_SYNC"
+          + ", net=" + ctrl.net_no
+          + ", layer=" + layer_no
+          + ", from_section=" + p_list_element.section_no_of_door
+          + ", backtrack_section=" + p_list_element.section_no_of_backtrack_door
+          + ", from_door=" + describe_expandable(p_list_element.door)
+          + ", next_room=" + describe_room(p_list_element.next_room)
+          + ", door_count_before=" + doorCountBeforeCompletion
+          + ", door_count_after=" + doorCountAfterCompletion);
+    }
 
     FloatPoint shape_entry_middle = p_list_element.shape_entry.a.middle_point(p_list_element.shape_entry.b);
 
@@ -474,20 +476,24 @@ public class MazeSearchAlgo {
     }
 
     List<ExpansionDoor> room_doors_snapshot = new LinkedList<>(p_list_element.next_room.get_doors());
-    FRLogger.trace("ROOM_DOOR context from_section=" + p_list_element.section_no_of_door
-        + ", backtrack_section=" + p_list_element.section_no_of_backtrack_door
-        + ", from_door=" + describe_expandable(p_list_element.door)
-        + ", next_room=" + describe_room(p_list_element.next_room)
-        + ", net=" + ctrl.net_no);
-    for (int door_index = 0; door_index < room_doors_snapshot.size(); door_index++) {
-      ExpansionDoor candidate_door = room_doors_snapshot.get(door_index);
-      FRLogger.trace("ROOM_DOOR candidate index=" + door_index
-          + ", from_section=" + p_list_element.section_no_of_door
+    if (FRLogger.isTraceEnabled()) {
+      FRLogger.trace("ROOM_DOOR context from_section=" + p_list_element.section_no_of_door
           + ", backtrack_section=" + p_list_element.section_no_of_backtrack_door
           + ", from_door=" + describe_expandable(p_list_element.door)
           + ", next_room=" + describe_room(p_list_element.next_room)
-          + ", candidate=" + describe_expandable(candidate_door)
           + ", net=" + ctrl.net_no);
+    }
+    for (int door_index = 0; door_index < room_doors_snapshot.size(); door_index++) {
+      ExpansionDoor candidate_door = room_doors_snapshot.get(door_index);
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("ROOM_DOOR candidate index=" + door_index
+            + ", from_section=" + p_list_element.section_no_of_door
+            + ", backtrack_section=" + p_list_element.section_no_of_backtrack_door
+            + ", from_door=" + describe_expandable(p_list_element.door)
+            + ", next_room=" + describe_room(p_list_element.next_room)
+            + ", candidate=" + describe_expandable(candidate_door)
+            + ", net=" + ctrl.net_no);
+      }
     }
 
     for (ExpansionDoor to_door : room_doors_snapshot) {
@@ -655,7 +661,9 @@ public class MazeSearchAlgo {
         && p_door.second_room instanceof CompleteFreeSpaceExpansionRoom) {
       TileShape door_shape = p_door.get_shape();
       if (door_shape.is_empty()) {
-        FRLogger.trace("MazeSearchAlgo:check_door_width door_shape is empty");
+        if (FRLogger.isTraceEnabled()) {
+          FRLogger.trace("MazeSearchAlgo:check_door_width door_shape is empty");
+        }
         return true;
       }
 
@@ -684,30 +692,32 @@ public class MazeSearchAlgo {
       MazeSearchElement.Adjustment p_adjustment) {
     boolean door_section_occupied = p_door.get_maze_search_element(p_section_no).is_occupied;
     if (door_section_occupied || p_shape_entry == null) {
-      FRLogger.trace("RAW_SECTION skip selected_section=" + p_section_no
-          + ", from_section=" + p_from_element.section_no_of_door
-          + ", backtrack_section=" + p_from_element.section_no_of_backtrack_door
-          + ", occupied=" + door_section_occupied
-          + ", shape_entry_null=" + (p_shape_entry == null)
-          + ", adjustment=" + p_adjustment
-          + ", door=" + describe_expandable(p_door)
-          + ", door_bounds=" + describe_expandable_bounds(p_door)
-          + ", from_door=" + describe_expandable(p_from_element.door)
-          + ", from_door_bounds=" + describe_expandable_bounds(p_from_element.door)
-          + ", net=" + ctrl.net_no);
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("RAW_SECTION skip selected_section=" + p_section_no
+            + ", from_section=" + p_from_element.section_no_of_door
+            + ", backtrack_section=" + p_from_element.section_no_of_backtrack_door
+            + ", occupied=" + door_section_occupied
+            + ", shape_entry_null=" + (p_shape_entry == null)
+            + ", adjustment=" + p_adjustment
+            + ", door=" + describe_expandable(p_door)
+            + ", door_bounds=" + describe_expandable_bounds(p_door)
+            + ", from_door=" + describe_expandable(p_from_element.door)
+            + ", from_door_bounds=" + describe_expandable_bounds(p_from_element.door)
+            + ", net=" + ctrl.net_no);
+      }
       FRLogger.trace("MazeSearchAlgo.expand_to_door_section", "skip_assign_raw",
-          "selected_section=" + p_section_no
+          () -> "selected_section=" + p_section_no
               + ", from_section=" + p_from_element.section_no_of_door
               + ", backtrack_section=" + p_from_element.section_no_of_backtrack_door
               + ", occupied=" + door_section_occupied
               + ", shape_entry_null=" + (p_shape_entry == null)
               + ", adjustment=" + p_adjustment,
-          "Net #" + ctrl.net_no
+          () -> "Net #" + ctrl.net_no
               + ", door=" + describe_expandable(p_door)
               + ", door_bounds=" + describe_expandable_bounds(p_door)
               + ", from_door=" + describe_expandable(p_from_element.door)
               + ", from_door_bounds=" + describe_expandable_bounds(p_from_element.door),
-          to_impacted_points(p_shape_entry));
+          () -> to_impacted_points(p_shape_entry));
       return false;
     }
     CompleteExpansionRoom next_room = p_door.other_room(p_from_element.next_room);
@@ -757,21 +767,23 @@ public class MazeSearchAlgo {
     if (p_add_costs > 0 && p_adjustment == MazeSearchElement.Adjustment.NONE) {
       new_element.ripup_cost = (int) p_add_costs;
     }
-    FRLogger.trace("RAW_SECTION assign selected_section=" + p_section_no
-        + ", from_section=" + p_from_element.section_no_of_door
-        + ", backtrack_section=" + p_from_element.section_no_of_backtrack_door
-        + ", add_costs=" + p_add_costs
-        + ", adjustment=" + p_adjustment
-        + ", room_ripped=" + room_ripped
-        + ", expansion_value=" + expansion_value
-        + ", sorting_value=" + sorting_value
-        + ", door=" + describe_expandable(p_door)
-        + ", door_bounds=" + describe_expandable_bounds(p_door)
-        + ", from_door=" + describe_expandable(p_from_element.door)
-        + ", from_door_bounds=" + describe_expandable_bounds(p_from_element.door)
-        + ", net=" + ctrl.net_no);
+    if (FRLogger.isTraceEnabled()) {
+      FRLogger.trace("RAW_SECTION assign selected_section=" + p_section_no
+          + ", from_section=" + p_from_element.section_no_of_door
+          + ", backtrack_section=" + p_from_element.section_no_of_backtrack_door
+          + ", add_costs=" + p_add_costs
+          + ", adjustment=" + p_adjustment
+          + ", room_ripped=" + room_ripped
+          + ", expansion_value=" + expansion_value
+          + ", sorting_value=" + sorting_value
+          + ", door=" + describe_expandable(p_door)
+          + ", door_bounds=" + describe_expandable_bounds(p_door)
+          + ", from_door=" + describe_expandable(p_from_element.door)
+          + ", from_door_bounds=" + describe_expandable_bounds(p_from_element.door)
+          + ", net=" + ctrl.net_no);
+    }
     FRLogger.trace("MazeSearchAlgo.expand_to_door_section", "assign_raw",
-        "selected_section=" + p_section_no
+        () -> "selected_section=" + p_section_no
             + ", from_section=" + p_from_element.section_no_of_door
             + ", backtrack_section=" + p_from_element.section_no_of_backtrack_door
             + ", add_costs=" + p_add_costs
@@ -779,12 +791,12 @@ public class MazeSearchAlgo {
             + ", room_ripped=" + room_ripped
             + ", expansion_value=" + expansion_value
             + ", sorting_value=" + sorting_value,
-        "Net #" + ctrl.net_no
+        () -> "Net #" + ctrl.net_no
             + ", door=" + describe_expandable(p_door)
             + ", door_bounds=" + describe_expandable_bounds(p_door)
             + ", from_door=" + describe_expandable(p_from_element.door)
             + ", from_door_bounds=" + describe_expandable_bounds(p_from_element.door),
-        to_impacted_points(p_shape_entry));
+        () -> to_impacted_points(p_shape_entry));
     this.maze_expansion_list.add(new_element);
     return true;
   }
@@ -827,8 +839,7 @@ public class MazeSearchAlgo {
     if (p_door == null) {
       return "null";
     }
-    IntBox bounds = p_door.get_shape().bounding_box();
-    return "[(" + bounds.ll.x + "," + bounds.ll.y + ")..(" + bounds.ur.x + "," + bounds.ur.y + ")]";
+    return FRLogger.formatBounds(p_door.get_shape().bounding_box());
   }
 
   private static String describe_room(CompleteExpansionRoom p_room) {
@@ -848,26 +859,8 @@ public class MazeSearchAlgo {
     return new Point[]{p_shape_entry.a.round(), p_shape_entry.b.round()};
   }
 
-  private boolean shouldTraceFanoutDiagnostics() {
-    return ctrl.is_fanout
-        && ctrl.fanout_start_pin_name != null
-        && ctrl.fanout_start_pin_name.startsWith("U27-");
-  }
 
-  private String fanoutDiagnosticLabel() {
-    return ctrl.fanout_start_pin_name == null ? "fanout-pin(net=" + ctrl.net_no + ")"
-        : ctrl.fanout_start_pin_name;
-  }
 
-  private void traceFanoutDiagnostic(String event, String message) {
-    if (!shouldTraceFanoutDiagnostics()) {
-      return;
-    }
-    FRLogger.trace("FANOUT_DIAG event=" + event
-        + ", pin=" + fanoutDiagnosticLabel()
-        + ", net=" + ctrl.net_no
-        + ", " + message);
-  }
 
   private void expand_to_drill(ExpansionDrill p_drill, MazeListElement p_from_element, int p_add_costs) {
     int layer = p_from_element.next_room.get_layer();
@@ -881,11 +874,6 @@ public class MazeSearchAlgo {
       if (p_from_element.backtrack_door == null || !p_drill
           .get_shape()
           .intersects(p_from_element.backtrack_door.get_shape())) {
-        traceFanoutDiagnostic("drill_rejected_thin_room_no_backtrack_intersection",
-            "drill=" + describe_expandable(p_drill)
-                + ", from_door=" + describe_expandable(p_from_element.door)
-                + ", backtrack=" + describe_expandable(p_from_element.backtrack_door)
-                + ", room=" + describe_room(p_from_element.next_room));
         return;
       }
     }
@@ -940,11 +928,6 @@ public class MazeSearchAlgo {
         MazeSearchElement.Adjustment.NONE,
         false);
     this.maze_expansion_list.add(new_element);
-    traceFanoutDiagnostic("drill_accepted",
-        "drill=" + describe_expandable(p_drill)
-            + ", room=" + describe_room(p_from_element.next_room)
-            + ", nearest_point=" + nearest_point
-            + ", expansion_value=" + expansion_value);
   }
 
   /**
@@ -983,55 +966,17 @@ public class MazeSearchAlgo {
     int from_room_layer = p_from_element.section_no_of_door;
     DrillPage drill_page = (DrillPage) p_from_element.door;
     Collection<ExpansionDrill> drill_list = drill_page.get_drills(this.autoroute_engine, this.ctrl.attach_smd_allowed);
-    if (shouldTraceFanoutDiagnostics()) {
-      traceFanoutDiagnostic("drill_page_scan",
-          "candidate_count=" + drill_list.size()
-              + ", attach_smd_allowed=" + this.ctrl.attach_smd_allowed
-              + ", room=" + describe_room(p_from_element.next_room)
-              + ", from_door=" + describe_expandable(p_from_element.door));
-      if (drill_list.isEmpty()) {
-        traceFanoutDiagnostic("drill_page_empty", "no_candidates=true");
-      }
-    }
     // Track the first room-mismatch per fanout attempt for first-mismatch investigation.
-    boolean firstMismatchLogged = false;
     for (ExpansionDrill curr_drill : drill_list) {
       int section_no = from_room_layer - curr_drill.first_layer;
       if (section_no < 0 || section_no >= curr_drill.room_arr.length) {
-        traceFanoutDiagnostic("drill_rejected_section_out_of_range",
-            "drill=" + describe_expandable(curr_drill)
-                + ", section=" + section_no + ", room_arr_len=" + curr_drill.room_arr.length);
         continue;
       }
       if (curr_drill.room_arr[section_no] != p_from_element.next_room) {
-        traceFanoutDiagnostic("drill_rejected_room_mismatch",
-            "drill=" + describe_expandable(curr_drill)
-                + ", expected_room=" + describe_room(p_from_element.next_room)
-                + ", drill_room=" + describe_room(curr_drill.room_arr[section_no]));
         // Log the first mismatch per page-scan with extra geometric context for investigation.
-        if (!firstMismatchLogged && shouldTraceFanoutDiagnostics()) {
-          firstMismatchLogged = true;
-          CompleteExpansionRoom expRoom = p_from_element.next_room;
-          CompleteExpansionRoom drillRoom = curr_drill.room_arr[section_no];
-          FRLogger.trace("FANOUT_DIAG event=first_room_mismatch_detail"
-              + ", pin=" + fanoutDiagnosticLabel()
-              + ", net=" + ctrl.net_no
-              + ", drill_location=" + curr_drill.location
-              + ", expansion_room_id=" + System.identityHashCode(expRoom)
-              + ", expansion_room_bounds=" + (expRoom != null ? expRoom.get_shape() : "null")
-              + ", drill_room_id=" + System.identityHashCode(drillRoom)
-              + ", drill_room_bounds=" + (drillRoom != null ? drillRoom.get_shape() : "null")
-              + ", from_door_type=" + (p_from_element.door != null ? p_from_element.door.getClass().getSimpleName() : "null")
-              + ", backtrack_door_type=" + (p_from_element.backtrack_door != null ? p_from_element.backtrack_door.getClass().getSimpleName() : "null")
-              + ", section_no=" + section_no
-              + ", layer=" + from_room_layer);
-        }
         continue;
       }
       if (curr_drill.get_maze_search_element(section_no).is_occupied) {
-        traceFanoutDiagnostic("drill_rejected_section_occupied",
-            "drill=" + describe_expandable(curr_drill)
-                + ", section=" + section_no);
         continue;
       }
       expand_to_drill(curr_drill, p_from_element, 0);
@@ -1238,8 +1183,10 @@ public class MazeSearchAlgo {
     }
 
     if (!destination_ok) {
-      FRLogger.debug("MazeSearchAlgo.init: Failed - no valid destination items found" +
-          " (dest set size: " + p_destination_items.size() + ", is_fanout: " + this.ctrl.is_fanout + ")");
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("MazeSearchAlgo.init: Failed - no valid destination items found" +
+            " (dest set size: " + p_destination_items.size() + ", is_fanout: " + this.ctrl.is_fanout + ")");
+      }
       return false;
     }
     // process the start items
@@ -1316,14 +1263,16 @@ public class MazeSearchAlgo {
       }
     }
     if (!start_ok) {
-      FRLogger.debug("MazeSearchAlgo.init: Failed - no accessible expansion doors found" +
-          " (start items: " + p_start_items.size() +
-          ", start rooms: " + start_rooms.size() +
-          ", completed start rooms: " + completed_start_rooms.size() +
-          ", expansion doors found: " + expansion_doors_found +
-          ", destination doors: " + expansion_doors_destination +
-          ", ripup_allowed: " + this.ctrl.ripup_allowed +
-          ", ripup_costs: " + this.ctrl.ripup_costs + ")");
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("MazeSearchAlgo.init: Failed - no accessible expansion doors found" +
+            " (start items: " + p_start_items.size() +
+            ", start rooms: " + start_rooms.size() +
+            ", completed start rooms: " + completed_start_rooms.size() +
+            ", expansion doors found: " + expansion_doors_found +
+            ", destination doors: " + expansion_doors_destination +
+            ", ripup_allowed: " + this.ctrl.ripup_allowed +
+            ", ripup_costs: " + this.ctrl.ripup_costs + ")");
+      }
     }
     return start_ok;
   }
@@ -1461,17 +1410,19 @@ public class MazeSearchAlgo {
       }
       obstacleNets = java.util.Arrays.toString(nets);
     }
-    FRLogger.trace("CHECK_RIPUP net=" + ctrl.net_no
-        + ", obstacle_id=" + (p_obstacle_item instanceof app.freerouting.board.Item obstItem ? obstItem.get_id_no() : -1)
-        + ", obstacle_nets=" + obstacleNets
-        + ", connection_items=" + connectionItemIds
-        + ", half_width=" + cost_factor
-        + ", ripup_costs=" + this.ctrl.ripup_costs
-        + ", trace_length=" + trace_length
-        + ", min_trace_length=" + min_trace_length
-        + ", item_count=" + item_count
-        + ", detour=" + detour
-        + ", result=" + result);
+    if (FRLogger.isTraceEnabled()) {
+      FRLogger.trace("CHECK_RIPUP net=" + ctrl.net_no
+          + ", obstacle_id=" + (p_obstacle_item instanceof app.freerouting.board.Item obstItem ? obstItem.get_id_no() : -1)
+          + ", obstacle_nets=" + obstacleNets
+          + ", connection_items=" + connectionItemIds
+          + ", half_width=" + cost_factor
+          + ", ripup_costs=" + this.ctrl.ripup_costs
+          + ", trace_length=" + trace_length
+          + ", min_trace_length=" + min_trace_length
+          + ", item_count=" + item_count
+          + ", detour=" + detour
+          + ", result=" + result);
+    }
     return result;
   }
 

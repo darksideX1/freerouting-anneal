@@ -25,7 +25,19 @@ public class FreeroutingAnalyticsClient implements AnalyticsClient {
   private final String WRITE_KEY;
   private final String LIBRARY_NAME = "freerouting";
   private final String LIBRARY_VERSION;
-  private boolean enabled = true;
+  // volatile for the cheap pre-thread check; the authoritative gate is transmissionLock
+  // below, because volatile buys visibility, not atomicity -- a sender that had already
+  // passed a volatile check could open the connection and write AFTER setEnabled(false)
+  // returned. Withdrawal must be atomic with transmission, not merely visible to it.
+  private volatile boolean enabled = true;
+
+  /**
+   * Held across [consent check + the entire network write] by senders, and by
+   * {@code setEnabled}. When a withdrawal returns, nothing is mid-transmission and nothing
+   * will start; a payload that was mid-write completed before the withdrawal returned.
+   * Connection timeouts below bound how long a withdrawal can block on an in-flight send.
+   */
+  private final Object transmissionLock = new Object();
 
   public FreeroutingAnalyticsClient(String libraryVersion, String key) {
     LIBRARY_VERSION = libraryVersion;
@@ -41,6 +53,15 @@ public class FreeroutingAnalyticsClient implements AnalyticsClient {
     {
       HttpURLConnection connection = null;
 
+      // The lock makes the recheck ATOMIC with the transmission. Without it, a sender that
+      // passed a mere volatile check could still serialize, connect and write after
+      // setEnabled(false) had returned -- and for the identify payload that means the email
+      // address goes out after consent was withdrawn.
+      synchronized (transmissionLock) {
+      if (!enabled) {
+        return;
+      }
+
       try {
         // Serialize to JSON using GSON
         String jsonPayload = GsonProvider.GSON.toJson(payload);
@@ -50,6 +71,9 @@ public class FreeroutingAnalyticsClient implements AnalyticsClient {
         connection = (HttpURLConnection) uri
             .toURL()
             .openConnection();
+        // Bound the transmission, and with it the longest a consent withdrawal can wait.
+        connection.setConnectTimeout(5000);
+        connection.setReadTimeout(5000);
         connection.setRequestMethod("POST");
         connection.setRequestProperty("Host", uri.getHost());
         connection.setRequestProperty("Content-Type", "application/json");
@@ -89,6 +113,7 @@ public class FreeroutingAnalyticsClient implements AnalyticsClient {
         // output when the analytics endpoint is down.  Delegate to the aggregator, which
         // logs the first failure immediately and then emits a single hourly summary.
         AnalyticsErrorAggregator.recordFailure(endpoint, e);
+      }
       }
     }).start();
   }
@@ -142,6 +167,15 @@ public class FreeroutingAnalyticsClient implements AnalyticsClient {
   }
 
   public void setEnabled(boolean enabled) {
+    // Deliberately NOT taking transmissionLock: this is called on the Swing event-dispatch
+    // thread, and waiting out an in-flight HTTP exchange (up to both timeout windows) would
+    // freeze the UI at the exact moment the user is exercising consent.
+    //
+    // The volatile write still guarantees that no NEW transmission starts after this
+    // returns -- senders read the flag inside the lock before any I/O. What it gives up is
+    // waiting for at most ONE in-flight payload, whose drain is bounded by the 5s connect
+    // and read timeouts. A frozen UI teaches users that opting out is punished; a bounded
+    // single-payload drain does not.
     this.enabled = enabled;
   }
 }

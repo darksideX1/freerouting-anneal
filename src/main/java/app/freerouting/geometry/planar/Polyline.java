@@ -255,7 +255,7 @@ public class Polyline implements Serializable {
    */
   public Point[] corner_arr() {
     if (arr.length < 2) {
-      return new Point[0];
+      return Point.EMPTY;
     }
     if (precalculated_corners == null)
     // corner array is not yet allocated
@@ -324,7 +324,9 @@ public class Polyline implements Serializable {
    */
   public Point corner(int p_no) {
     if (arr.length < 2) {
-      FRLogger.trace("Polyline.corner: arr.length is < 2");
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("Polyline.corner: arr.length is < 2");
+      }
       return null;
     }
     int no;
@@ -828,7 +830,7 @@ public class Polyline implements Serializable {
     FRLogger.trace(
         "Polyline.split",
         "compare_trace_split_called",
-        "p_line_no="
+        () -> "p_line_no="
             + p_line_no
             + ", arr.length="
             + arr.length
@@ -846,8 +848,8 @@ public class Polyline implements Serializable {
             + ")"
             + ", equals="
             + new_end_corner.equals(this.last_corner()),
-        "Polyline split p_line_no=" + p_line_no,
-        new Point[] { this.first_corner(), new_end_corner, this.last_corner() });
+        () -> "Polyline split p_line_no=" + p_line_no,
+        () -> new Point[] { this.first_corner(), new_end_corner, this.last_corner() });
     StringBuilder sb = new StringBuilder("    CORNERS:");
     for (int i = 0; i < this.corner_count(); i++) {
       sb.append(" ").append(this.corner_approx(i));
@@ -855,9 +857,9 @@ public class Polyline implements Serializable {
     FRLogger.trace(
         "Polyline.split",
         "compare_trace_split_corners",
-        sb.toString(),
-        "Polyline split p_line_no=" + p_line_no,
-        new Point[] { this.first_corner(), new_end_corner, this.last_corner() });
+        () -> sb.toString(),
+        () -> "Polyline split p_line_no=" + p_line_no,
+        () -> new Point[] { this.first_corner(), new_end_corner, this.last_corner() });
     if (p_line_no == 1 && new_end_corner.equals(this.first_corner())
         || p_line_no >= arr.length - 2 && new_end_corner.equals(this.last_corner())) {
       // No split, if p_end_line does not intersect, but touches

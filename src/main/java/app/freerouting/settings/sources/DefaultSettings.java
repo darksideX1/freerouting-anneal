@@ -91,7 +91,17 @@ public class DefaultSettings implements SettingsSource {
 
         settings.enabled = true;
         settings.algorithm = RouterSettings.ALGORITHM_CURRENT;
-        settings.jobTimeoutString = "12:00:00";
+        // Three minutes, not twelve hours. The old ceiling was harmless only while the
+        // optimizer was broken: it stopped after one useless pass and nothing ever reached
+        // the limit. Now that it works, an unbounded default lets a heavy board spend 449
+        // seconds and 435 GB polishing a result that stopped improving measurably long
+        // before -- 240 s and 480 s budgets produce no measurable difference in the routed
+        // board, so the wall sits well below either.
+        //
+        // The optimizer derives its own deadline from this one and stops just inside it, so
+        // the stage ends by choice instead of being cut off mid-pass. Raise this for a
+        // better board; disable the optimizer for a faster one. Both are one flag.
+        settings.jobTimeoutString = "00:15:00";
         settings.maxPasses = 9999;
         settings.maxItems = Integer.MAX_VALUE;
         settings.trace_pull_tight_accuracy = 500;
@@ -127,7 +137,13 @@ public class DefaultSettings implements SettingsSource {
         settings.optimizer.algorithm = "freerouting-optimizer";
         settings.optimizer.maxPasses = 100;
         settings.optimizer.maxItems = Integer.MAX_VALUE;
-        settings.optimizer.maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
+        // Width 2 is the measured quality point: it beat the single-threaded optimiser on
+        // completion, vias and length at half its wall, on two machines, independently
+        // graded. Quality degrades monotonically with width (length +7% from width 2 to
+        // 16), so scaling with core count is a measured regression, not a default. Cores
+        // remain only as a CEILING (clamped at pool construction); 6-8 is the informed
+        // speed setting, documented, never silently chosen.
+        settings.optimizer.maxThreads = 2;
         settings.optimizer.optimizationImprovementThreshold = 0.01f;
         settings.optimizer.boardUpdateStrategy = BoardUpdateStrategy.GREEDY;
         settings.optimizer.hybridRatio = "1:1";
@@ -135,7 +151,6 @@ public class DefaultSettings implements SettingsSource {
         settings.optimizer.additionalRipupCostFactorAtStart = 10;
         settings.optimizer.traceRipupCostFactor = 0.6f;
         settings.optimizer.maxAutoroutePasses = 6;
-        settings.optimizer.maxConsecutiveFailures = 50;
 
         // Scalar trace-cost defaults (layer-specific arrays are omitted for the same reason as
         // the layer arrays above – their sizes depend on the board).

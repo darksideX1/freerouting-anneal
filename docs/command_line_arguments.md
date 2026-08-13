@@ -53,17 +53,23 @@ Below is a comprehensive list of command-line options available in Freerouting, 
 - **`-mp [number of passes]`**  
   Sets the upper limit for the number of autorouter passes to perform. More passes may result in better optimization but will take longer.
 
-- **`-mt [number of threads]`**  
-  Sets the thread pool size for route optimization:
-  - Default: One less than the number of logical processors on the system.
-  - Set to `0` to disable route optimization.
-  - Increasing the number may improve performance on multi-core systems.
+- **`-mt [number of threads]`**
+  Width of the RACING autorouter (redundant parallel routing attempts with identical
+  settings and different item orderings; the best attempt wins). Acts only together
+  with `--router.racing_enabled=true`; alone it changes nothing. Measured: racing
+  returned the same or a worse board than a single attempt on every board tried, at
+  N x the memory -- it exists, it is correct, and it is not recommended.
+  Route OPTIMIZATION width is a different setting: `--router.optimizer.max_threads`
+  (default 2, the measured quality point; `1` = single-threaded).
 
-- **`-oit [percentage]`**  
-  Specifies the optimizer improvement threshold per pass:
-  - Default: `0.1%`
-  - The optimizer stops if the improvement falls below this threshold.
-  - Setting `-oit 0` continues optimization until manually stopped or no further improvements are possible.
+- **`-oit [percentage]`**
+  The optimiser close-to-perfect early stop (`improvement_threshold`): when the
+  board score is already within this percentage of the maximum score, further passes
+  are not worth their time and the stage stops. Default: `1%` (stored as the fraction
+  `0.01`; settable here in percent, or as `--router.optimizer.improvement_threshold`
+  with the fraction). `-oit 0` disables this early stop. This is NOT the stall guard:
+  the work-window guard (and its `rounds` override) governs stagnation; this threshold
+  only ends runs that are already near the ceiling.
 
 - **`-inc [net class names]`**  
   Lists net classes to ignore during autorouting:
@@ -172,6 +178,125 @@ Below is a comprehensive list of command-line options available in Freerouting, 
 
 - **`-help`**
   Displays help information and exits.
+
+## Options added by this fork
+
+Upstream's flags above still work. These are new, and the first one matters most: it is the
+budget for the whole job, and every stage derives its deadline from it.
+
+### `--router.job_timeout=HH:MM:SS`
+
+How long the whole run may take. **Default `00:15:00`.** Not a per-stage allowance — fanout,
+routing and optimisation all derive their deadline from this one value, and each finishes
+the pass it is in rather than being cut mid-write.
+
+```bash
+java -jar freerouting-anneal-1.1.1.jar -de board.dsn -do board.ses --router.job_timeout=01:00:00
+```
+
+Raise it when a run reports `Ran out of time.` — that ending means the router was still
+improving when the clock stopped it. `Pass finished. No further improvements found.` means a
+longer budget buys nothing.
+
+In the GUI the same value is `Settings → Auto-router → Timeout`.
+
+### `--router.optimizer.enabled=false`
+
+Skip optimisation and take the routing-only board. Measured 2-3x faster overall on
+boards that route quickly (the optimisation stage is where most of their time goes);
+on a board whose ROUTING stage takes hours, it saves none of those hours — routing
+is still routing. Leaves more unrouted
+connections. Useful when you want the result now and will judge it yourself.
+
+### `--router.optimizer.rounds=N`
+
+How many items the optimisation stage may examine per pass. Setting it switches the
+automatic progress guard OFF and uses this cap instead — one mechanism or the other,
+never both, so a run is always explainable from a single line of the log.
+
+The stage is probabilistic rather than converging: passes find improvements or they do
+not, mostly vias and occasionally a connection, so more items examined means more chances
+rather than steadier progress. Measured against routing alone on a 26-board set, 50 costs
+roughly 3.5x the routing time and buys the reference via reduction; 150 costs roughly 5.7x
+and buys a third more. Below 150 is rarely worth the clock.
+
+Zero or a negative value is rejected with an error and the automatic guard runs instead —
+the run tells you it is not configured as requested rather than silently switching modes.
+
+In the GUI the setting persists like every other setting.
+
+### `--router.optimizer.max_threads=N`
+
+How many threads the optimisation stage runs. **Default 2** — the measured quality point:
+slightly better boards than single-threaded at roughly half the wall clock. 4 trades a few
+vias for the best trace length per connection and more speed; 6 is the practical ceiling: the
+curve saturates between 6 and 8, so beyond 6 the clock stops improving while quality
+keeps degrading. Wider is never an upgrade. Your core count is a **ceiling, not a target**: a request above it is clamped
+and the run says so. On a one-core machine the single-threaded optimiser runs instead.
+
+Not to be confused with `--router.max_threads`, which is read by the *racing* autorouter
+(redundant parallel routing attempts), not by the optimiser — and racing acts only when
+`--router.racing_enabled=true` is ALSO set; alone, `--router.max_threads` changes nothing
+and the run routes single-threaded as always. The two names are historical; both are
+honoured, each by its own stage.
+
+### `--router.optimizer.memory_budget_mb=N`
+
+A cap on the memory the optimiser may spend on board clones. Default: 60 % of the JVM
+maximum heap. One clone per thread is the cost of width, so a tight budget reduces width
+to fit — each reduction is a stated warning. A budget below the measured cost of a single
+clone is refused with the numbers named, and the stage runs single-threaded in place.
+Degradation is always loud, never silent.
+
+### `--router.optimizer.board_update_strategy=greedy|global_optimal|hybrid`
+
+How an accepted improvement becomes the new master board. **Default `greedy`**, which won
+the measurements; `global_optimal` was dominated on every axis, and `hybrid` collapses
+into it. Values are case-insensitive.
+
+### `--router.optimizer.item_selection_strategy=prioritized|most_to_gain|sequential|random`
+
+The order items are offered to the optimiser. **Default `prioritized`**; `most_to_gain`
+measured equivalent to it, the other two are measured worse. Values are case-insensitive.
+
+### `--router.optimizer.restore_default_scoring=true`
+
+Experimental. When routing ran on a variant objective (for example raised via costs), this
+restores the DEFAULT objective for the optimisation stage only. Measured worse than
+running either objective end to end — a pipeline at war with itself converges to neither
+goal — so it ships as an instrument, not a recommendation, and says so in the log.
+
+### `--helpful`
+
+Prints the operating manual — what the stages do, how long to give it, how to stop without
+losing the board, and how to read the ending. It ships inside the jar, so it cannot drift
+away from the build you are holding.
+
+
+## Legacy short flags and their long forms
+
+The short flags above predate this fork; each maps to a long `--router.*` setting, and
+the long forms are the complete surface. The mappings that are not obvious:
+
+| Short | Long | Values accepted by the SHORT form |
+|---|---|---|
+| `-mt N` | `--router.max_threads=N` (racing width) | any number; acts only with racing enabled |
+| `-us S` | `--router.optimizer.board_update_strategy=S` | `greedy`, `global` (= `global_optimal`), `hybrid` |
+| `-is S` | `--router.optimizer.item_selection_strategy=S` | `sequential`, `random`, `prioritized` -- **`most_to_gain` needs the long flag**; anything unrecognised falls back to `prioritized` |
+| `-oit P` | `--router.optimizer.improvement_threshold=P/100` | percent here, fraction there |
+
+Syntax family note: the long `--section.property` settings take `=` (`--flag=value`);
+the short single-dash flags take a space (`-mt 4`). Historically a long flag given with
+a space was silently ignored; it is now refused with an error naming the flag.
+
+## Where settings come from
+
+Three layers, later wins: **code defaults** (the measured optimums this release ships) →
+**`freerouting.json`** in the user-data directory (every `--x.y=z` option has an
+identically-named key there, so anything on this page can be made permanent by editing
+that file) → **command-line arguments** for the single run. The user-data directory
+defaults to platform app-data (`%APPDATA%\freerouting`, `~/.local/share/freerouting`,
+`~/Library/Application Support/freerouting`) and moves with `--user_data_path=`.
 
 ## Adjusting Internal Settings
 
@@ -286,16 +411,19 @@ java -jar freerouting.jar -de MyBoard.dsn -do MyBoard.ses -inc GND,VCC
 - Nets in the `GND` and `VCC` classes will not be routed.
 - Useful when you plan to route these nets manually.
 
-### Example 3: Limiting the Number of Passes and Threads
+### Example 3: Limiting Passes and Trading Quality for Speed
 
-Limit the autorouter to 10 passes and use 4 threads:
+Limit the autorouter to 10 passes and run the optimiser 4 wide:
 
 ```bash
-java -jar freerouting.jar -de MyBoard.dsn -do MyBoard.ses -mp 10 -mt 4
+java -jar freerouting-anneal-1.1.1.jar -de MyBoard.dsn -do MyBoard.ses -mp 10 --router.optimizer.max_threads=4
 ```
 
-- Sets a cap on routing time and resource usage.
-- Adjust `-mt` based on your system's capabilities.
+- `-mp` caps the routing passes.
+- Width 4 trades a few vias for the best trace length per connection and more speed;
+  the default (2) is the measured quality point.
+- (The old form of this example paired `-mp` with `-mt 4`, which does nothing without
+  `--router.racing_enabled=true` -- `-mt` is the racing width, not the optimiser width.)
 
 ## Conclusion
 

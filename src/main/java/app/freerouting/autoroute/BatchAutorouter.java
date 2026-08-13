@@ -47,7 +47,7 @@ import java.util.TreeSet;
 /**
  * Handles the sequencing of the auto-router passes.
  */
-public class BatchAutorouter extends NamedAlgorithm {
+public class BatchAutorouter extends NamedAlgorithm implements BatchRoutingAlgorithm {
 
   // The lowest rank of the board to be selected to go back to.
   // Must not exceed BoardHistory.MAX_HISTORY_SIZE so the check can actually fire.
@@ -55,6 +55,14 @@ public class BatchAutorouter extends NamedAlgorithm {
   // Maximum number of tries on the same board
   private static final int MAXIMUM_TRIES_ON_THE_SAME_BOARD = 3;
   private static final int TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP = 1000;
+  /**
+   * How many {@link #TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP} slices a racing join may wait.
+   *
+   * <p>The join loop needs a hard cap so a worker that never terminates degrades the pass
+   * rather than the process. Generous on purpose: the job deadline is the real bound, and
+   * this only has to stop an unbounded wait.
+   */
+  private static final int MAX_RACING_JOIN_ATTEMPTS = 600;
   // The minimum number of passes to complete the board, unless all items are
   // routed
   private static final int STOP_AT_PASS_MINIMUM = 8;
@@ -74,6 +82,9 @@ public class BatchAutorouter extends NamedAlgorithm {
   private final AutorouteControl.ExpansionCostFactor[] trace_cost_arr;
   private final boolean retain_autoroute_database;
   private final int start_ripup_costs;
+
+  /** The racing/width conflict is warned once per job, not once per pass. */
+  private boolean racingMismatchWarned;
   private final int trace_pull_tight_accuracy;
   // Reusable collections to reduce memory churn (thread-safe as each thread has
   // its own BatchAutorouter instance)
@@ -82,6 +93,14 @@ public class BatchAutorouter extends NamedAlgorithm {
   protected RoutingJob job;
   private int totalItemsRouted = 0;
   private boolean fanoutTimedOut = false;
+
+  /** Set when a pass was cut short by an exception; see {@link PassOutcome#ABORTED}. */
+  private boolean endedAbnormally = false;
+
+  @Override
+  public boolean endedAbnormally() {
+    return this.endedAbnormally;
+  }
 
   public boolean isFanoutTimedOut() {
     return this.fanoutTimedOut;
@@ -143,6 +162,26 @@ public class BatchAutorouter extends NamedAlgorithm {
    * number of passes to complete the board or p_max_pass_count + 1, if the board
    * is not completed.
    */
+  /**
+   * Whether the optimiser's own re-router may run.
+   *
+   * <p>DEFECT 25. This used to ask {@code is_stop_auto_router_requested()}, which returns
+   * true for BOTH stop states -- and {@code AUTO_ROUTER_ONLY} exists precisely to mean
+   * "the auto-router is finished, now run the optimiser". So the flag whose purpose was to
+   * hand control TO the optimiser was the flag that switched its re-router off.
+   *
+   * <p>The consequence was silent and total: the re-route loop executed ZERO passes, so
+   * every item was ripped up, never re-routed, measured as worse, and undone. 45 items
+   * examined and 0 improved, on every pass, for 100 passes -- with byte-identical output,
+   * because the undo restored the board each time. It is the direct cause of this fork
+   * shipping 17 vias and 9% more trace length where the 2023 original produces 14.
+   *
+   * <p>A FULL stop still halts it: that is the user asking for everything to end.
+   */
+  static boolean optimizerRerouteMayRun(app.freerouting.core.StoppableThread thread) {
+    return !thread.isStopRequested();
+  }
+
   public static int autoroute_passes_for_optimizing_item(RoutingJob job, int p_max_pass_count, int p_ripup_costs,
       int trace_pull_tight_accuracy, boolean p_with_preferred_directions,
       RoutingBoard updated_routing_board, RouterSettings routerSettings) {
@@ -153,9 +192,12 @@ public class BatchAutorouter extends NamedAlgorithm {
 
     boolean still_unrouted_items = true;
     int curr_pass_no = 1;
-    while (still_unrouted_items && !job.thread.is_stop_auto_router_requested() && curr_pass_no <= p_max_pass_count) {
-      still_unrouted_items = router_instance.autoroute_pass(curr_pass_no);
-      if (still_unrouted_items && !job.thread.is_stop_auto_router_requested() && updated_routing_board == null) {
+    // `true` = this IS the optimiser's re-route, so only a FULL stop halts it. Passing
+    // false here (or calling is_stop_auto_router_requested directly) reintroduces defect
+    // 25: the loop runs zero passes and every optimisation is ripped up and undone.
+    while (still_unrouted_items && !routingShouldStop(job.thread, true) && curr_pass_no <= p_max_pass_count) {
+      still_unrouted_items = router_instance.autoroute_pass(curr_pass_no).shouldContinue();
+      if (still_unrouted_items && !routingShouldStop(job.thread, true) && updated_routing_board == null) {
       }
       ++curr_pass_no;
     }
@@ -179,7 +221,7 @@ public class BatchAutorouter extends NamedAlgorithm {
     if (item instanceof DrillItem drillItem) {
       return new Point[] { drillItem.get_center() };
     }
-    return new Point[0];
+    return Point.EMPTY;
   }
 
   private static float getCpuSecondsSnapshot(RoutingJob job) {
@@ -208,34 +250,34 @@ public class BatchAutorouter extends NamedAlgorithm {
     return job.resourceUsage.peakMemoryUsed;
   }
 
-  private static float sampleCurrentThreadCpuSeconds() {
-    try {
-      ThreadMXBean threadMxBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
-      long cpuNanos = threadMxBean.getThreadCpuTime(Thread.currentThread().threadId());
-      return cpuNanos < 0 ? -1f : cpuNanos / 1_000_000_000.0f;
-    } catch (Throwable t) {
-      return -1f;
-    }
+  /**
+   * Whether routing should stop, given who is doing the routing.
+   *
+   * <p>DEFECT 25, and the reason it needed a named helper rather than a raw predicate: the
+   * SAME pass code serves two callers with opposite requirements.
+   *
+   * <p>{@code StoppableThread} documents {@code AUTO_ROUTER_ONLY} as "stop the auto-router,
+   * but continue with the optimizer and other tasks". For the main routing stage that
+   * means stop. For the OPTIMISER'S re-route -- which runs the very same
+   * {@code autoroute_pass} -- it must mean carry on, because that state is precisely the
+   * signal that routing has finished and the optimiser now has the board.
+   *
+   * <p>Consulting {@code is_stop_auto_router_requested()} everywhere made the second caller
+   * impossible: the per-item loop broke on the first net of the first item, so the
+   * optimiser's re-route queued 29-31 items and routed ZERO, reported NO_PROGRESS, and
+   * every optimisation attempt ripped a connection up, failed to restore it, measured the
+   * board as worse and undid it. 45 items examined, 0 improved, on every pass.
+   *
+   * <p>A FULL stop halts both: that is the user ending the job.
+   */
+  static boolean routingShouldStop(app.freerouting.core.StoppableThread thread,
+      boolean isOptimizerReroute) {
+    return isOptimizerReroute ? thread.isStopRequested() : thread.is_stop_auto_router_requested();
   }
 
-  private static float sampleCurrentThreadAllocatedMb() {
-    try {
-      ThreadMXBean threadMxBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
-      threadMxBean.setThreadAllocatedMemoryEnabled(true);
-      long allocatedBytes = threadMxBean.getThreadAllocatedBytes(Thread.currentThread().threadId());
-      return allocatedBytes < 0 ? -1f : allocatedBytes / (1024.0f * 1024.0f);
-    } catch (Throwable t) {
-      return -1f;
-    }
-  }
-
-  private static float sampleHeapUsageMb() {
-    try {
-      long heapUsed = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
-      return heapUsed / (1024.0f * 1024.0f);
-    } catch (Throwable t) {
-      return 0f;
-    }
+  /** Instance form of {@link #routingShouldStop}, using this router's role. */
+  private boolean routingShouldStop() {
+    return routingShouldStop(this.thread, this.isOptimizerAutorouter);
   }
 
   private boolean shouldFireBoardUpdate() {
@@ -294,8 +336,10 @@ public class BatchAutorouter extends NamedAlgorithm {
                 }
                 autoroute_item_list.add(curr_item);
                 String netName = (net != null) ? net.name : "net#" + curr_net_no;
-                FRLogger.debug("Queuing item for routing: " + curr_item.getClass().getSimpleName() + " on net '"
-                    + netName + "' (connected: " + connected_set.size() + "/" + net_item_count + ")");
+                if (FRLogger.isDebugEnabled()) {
+                  FRLogger.debug("Queuing item for routing: " + curr_item.getClass().getSimpleName() + " on net '"
+                      + netName + "' (connected: " + connected_set.size() + "/" + net_item_count + ")");
+                }
               }
             }
           }
@@ -312,33 +356,202 @@ public class BatchAutorouter extends NamedAlgorithm {
    * <p>
    * Returns false if the board is already completely routed.
    */
-  private boolean autoroute_pass_multi_thread(int p_pass_no) {
+  /**
+   * Whether this pass should race several board copies instead of routing once.
+   *
+   * <p>Pure so the dispatch rule is testable, because the rule matters more than it looks:
+   * wiring racing to {@code maxThreads} would have enabled it for everyone by default,
+   * since that setting defaults to {@code availableProcessors - 1}.
+   *
+   * <p>A one-thread race is the single-threaded path plus a board copy and a join --
+   * strictly worse -- so it declines rather than pretending to honour the request.
+   */
+  static boolean shouldRace(boolean racingEnabled, int threadCount) {
+    return racingEnabled && (threadCount > 1);
+  }
+
+  /** Fraction of free heap racing may consume; the rest is left for the search itself. */
+  private static final int RACING_HEAP_RESERVE_DIVISOR = 2;
+
+  /**
+   * How many racing threads the heap can actually afford.
+   *
+   * <p>Every racing thread works on its own {@code board.deepCopy()}. The dead
+   * implementation allocated {@code maxThreads} of them with no reference to available
+   * memory, which on a large board is an OutOfMemoryError waiting for a user with more
+   * cores than headroom -- and works directly against "it must not eat my RAM".
+   *
+   * <p>{@code perBoardBytes} is MEASURED from the first real copy rather than estimated.
+   * Guessing the size of a routing board from item counts would be a second thing to be
+   * wrong about, and the first copy has to be made anyway.
+   *
+   * <p>Half the free heap is reserved: the router still has to do its work inside whatever
+   * racing leaves behind, and a thread count that fits the copies but starves the search
+   * has only moved the failure.
+   *
+   * @param requested      what the user asked for; memory may only ever SUBTRACT from this
+   * @param freeHeapBytes  heap currently available
+   * @param perBoardBytes  measured cost of one board copy; {@code <= 0} means the
+   *                       measurement FAILED (a GC during the probe can reclaim more than
+   *                       the copy allocates), and a failed safety measurement must not be
+   *                       read as unlimited capacity -- see below
+   */
+  static int safeThreadCount(int requested, long freeHeapBytes, long perBoardBytes) {
+    if (requested <= 1) {
+      return 1;
+    }
+    if (perBoardBytes <= 0) {
+      // This used to return `requested`, on the reasoning that refusing to race because a
+      // measurement failed would make racing depend on GC timing. That reasoning is wrong,
+      // and a reviewer was right to call it: it grants EVERY requested copy without ever
+      // consulting free heap, so on a large board under pressure the copy loop can throw
+      // OutOfMemoryError -- which the surrounding `catch (Exception)` does not catch, so it
+      // takes the process rather than the pass. An unusable measurement means we do not
+      // know what a copy costs, and the safe answer to "how many can I afford" when the
+      // cost is unknown is one.
+      return 1;
+    }
+    long budget = freeHeapBytes / RACING_HEAP_RESERVE_DIVISOR;
+    long affordable = budget / perBoardBytes;
+    if (affordable < 1) {
+      return 1;
+    }
+    return (int) Math.min(requested, affordable);
+  }
+
+  /**
+   * Seed for the run as a whole. Fixed by default so a race replays exactly.
+   *
+   * <p>The engine is already nondeterministic on some boards (defect 20) and that is
+   * documented rather than fixed. A NEW feature adding a second, avoidable source of
+   * variance would make the existing one harder to isolate, so this one is reproducible
+   * by construction.
+   */
+  private final long racingRunSeed = 0x5EEDL;
+
+  /**
+   * The ordering seed for one racing thread.
+   *
+   * <p>Must satisfy two properties that the shared-{@code Random} version satisfied
+   * neither of: the same coordinates always produce the same ordering, and no two threads
+   * in a pass -- nor the same thread across passes -- share one.
+   *
+   * <p>Mixed rather than combined arithmetically. The obvious {@code pass * k + thread}
+   * collides the moment the thread count exceeds {@code k}, and the failure is silent:
+   * two threads quietly explore the same ordering and the race pays for a duplicate.
+   */
+  static long orderingSeedFor(long runSeed, int passNo, int threadIndex) {
+    long mixed = runSeed;
+    mixed = (mixed * 0x9E3779B97F4A7C15L) ^ (passNo * 0xBF58476D1CE4E5B9L);
+    mixed = (mixed * 0x94D049BB133111EBL) ^ (threadIndex * 0xD6E8FEB86659FD93L);
+    // Final avalanche, so neighbouring coordinates do not produce neighbouring seeds.
+    mixed ^= (mixed >>> 33);
+    mixed *= 0xFF51AFD7ED558CCDL;
+    mixed ^= (mixed >>> 33);
+    return mixed;
+  }
+
+  /**
+   * The winning thread of a racing pass, ignoring threads that never finished.
+   *
+   * <p>A board whose thread is still running has no score worth reading -- the statistics
+   * call traverses a search tree the thread is still mutating. {@code usable} marks the
+   * threads that actually terminated; everything else is not a candidate, however good its
+   * half-written board may look.
+   *
+   * @return the winning index, or -1 if nothing finished
+   */
+  static int bestThreadIndexByScore(float[] scores, boolean[] usable) {
+    int best = -1;
+    for (int i = 0; i < scores.length; i++) {
+      if (i < usable.length && !usable[i]) {
+        continue;
+      }
+      if (best < 0 || scores[i] > scores[best]) {
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * The winning thread of a racing pass: highest score, ties to the lowest index.
+   *
+   * <p>Pure and package-visible so the rule can be tested and argued with, because it is
+   * the algorithm rather than an implementation detail of it.
+   *
+   * <p>Ties break to the lowest index deliberately. It is arbitrary, but it is
+   * DETERMINISTIC — a tie broken by thread completion order would make the race
+   * unreproducible again, which is the thing this stream exists to fix.
+   *
+   * @return the index of the winner, or -1 when there are no threads
+   */
+  static int bestThreadIndexByScore(float[] scores) {
+    int best = -1;
+    float bestScore = 0;
+    for (int i = 0; i < scores.length; i++) {
+      // Note the (best < 0) guard: scores are normalised and can be negative, so a max
+      // initialised to zero would silently adopt the worst board on an all-negative pass.
+      if ((best < 0) || (scores[i] > bestScore)) {
+        best = i;
+        bestScore = scores[i];
+      }
+    }
+    return best;
+  }
+
+  private PassOutcome autoroute_pass_multi_thread(int p_pass_no) {
     try {
       List<Item> autoroute_item_list = getAutorouteItems(this.board);
 
       // If there are no items to route, we're done
       if (autoroute_item_list.isEmpty()) {
         this.air_line = null;
-        return false;
+        return PassOutcome.NO_PROGRESS;
       }
 
       boolean useSlowAlgorithm = false;
 
-      BatchAutorouterThread[] autorouterThreads = new BatchAutorouterThread[job.routerSettings.maxThreads];
+      // Measure one board copy before committing to N of them. The first copy has to be
+      // made regardless, so the measurement is free -- and it is a measurement rather than
+      // an estimate, which is the difference between a thread count that fits and one that
+      // was guessed.
+      Runtime runtime = Runtime.getRuntime();
+      System.gc();
+      long heapBeforeProbe = runtime.totalMemory() - runtime.freeMemory();
+      RoutingBoard probeBoard = this.board.deepCopy();
+      long perBoardBytes = (runtime.totalMemory() - runtime.freeMemory()) - heapBeforeProbe;
+      long freeHeapBytes = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory());
+
+      int requestedThreads = job.routerSettings.maxThreads;
+      int threadCount = safeThreadCount(requestedThreads, freeHeapBytes, perBoardBytes);
+      if (threadCount < requestedThreads) {
+        job.logWarning("Racing with " + threadCount + " thread(s) instead of the requested "
+            + requestedThreads + ": one board copy measured " + (perBoardBytes / (1024 * 1024))
+            + " MB and only " + (freeHeapBytes / (1024 * 1024)) + " MB of heap is free."
+            + " Give the JVM a larger -Xmx to race wider.");
+      }
+
+      BatchAutorouterThread[] autorouterThreads = new BatchAutorouterThread[threadCount];
       BoardHistory bh = new BoardHistory(job.routerSettings.scoring);
 
       // Prepare the threads
-      for (int threadIndex = 0; threadIndex < job.routerSettings.maxThreads; threadIndex++) {
-        // deep copy the board
+      for (int threadIndex = 0; threadIndex < threadCount; threadIndex++) {
+        // Thread 0 reuses the copy already made for the measurement; copying the board
+        // twice to decide how many copies we can afford would be its own small joke.
         PerformanceProfiler.start("board.deepCopy");
-        RoutingBoard clonedBoard = this.board.deepCopy();
+        RoutingBoard clonedBoard = (threadIndex == 0) ? probeBoard : this.board.deepCopy();
         PerformanceProfiler.end("board.deepCopy");
 
         // clone the auto-route item list to avoid concurrent modification
         List<Item> clonedAutorouteItemList = new ArrayList<>(getAutorouteItems(clonedBoard));
 
-        // shuffle the items to route
-        shuffle(clonedAutorouteItemList, this.random);
+        // Each thread gets its OWN generator, seeded from (run, pass, thread). Sharing one
+        // Random made the orderings depend on which thread reached it first -- so the race
+        // did not reproduce -- and guaranteed nothing about the orderings being different
+        // from each other, which is the only reason to run more than one of them.
+        shuffle(clonedAutorouteItemList,
+            new java.util.Random(orderingSeedFor(racingRunSeed, p_pass_no, threadIndex)));
 
         autorouterThreads[threadIndex] = new BatchAutorouterThread(clonedBoard, clonedAutorouteItemList, p_pass_no,
             job.routerSettings, this.start_ripup_costs,
@@ -358,24 +571,86 @@ public class BatchAutorouter extends NamedAlgorithm {
       });
 
       // Start the threads
-      for (int threadIndex = 0; threadIndex < job.routerSettings.maxThreads; threadIndex++) {
+      for (int threadIndex = 0; threadIndex < threadCount; threadIndex++) {
         // start the thread
         autorouterThreads[threadIndex].start();
       }
 
-      // Wait for the threads to finish
-      for (int threadIndex = 0; threadIndex < job.routerSettings.maxThreads; threadIndex++) {
+      // Wait for the threads to finish -- ACTUALLY finish.
+      //
+      // This used to be a single join(TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP), and that
+      // constant is 1000 milliseconds while a pass takes seconds. The wait therefore
+      // always expired, and everything below it -- bh.add(), get_statistics() -- then read
+      // a board whose own thread was still writing it. get_statistics() walks the search
+      // tree, which is exactly where the crashes land:
+      //   ShapeSearchTree.overlapping_tree_entries_with_clearance
+      //   Item.clearance_violations
+      //   ShapeTree$Leaf.compareTo
+      // all failing on a null leaf object, at a rate that did not vary with worker count
+      // because this read happens once per pass regardless of how many workers there are.
+      boolean[] threadFinished = new boolean[threadCount];
+
+      // ONE budget for the whole join phase, not one per worker.
+      //
+      // Each worker used to get its own MAX_RACING_JOIN_ATTEMPTS slices, so with N workers
+      // the join could sit here for N x 600 seconds -- long past the job deadline the user
+      // set -- and nothing here consulted the parent's stop flag or the stage deadline. A
+      // cancel during a pass was simply not noticed until every worker had been waited out.
+      //
+      // Same defect class as defect 30: work continuing after the thing that should have
+      // stopped it already fired.
+      long joinDeadlineMs = System.currentTimeMillis()
+          + (long) MAX_RACING_JOIN_ATTEMPTS * TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP;
+      Long jobDeadlineMs =
+          (this.job != null && this.job.timeoutAt != null) ? this.job.timeoutAt.toEpochMilli() : null;
+      if (jobDeadlineMs != null) {
+        joinDeadlineMs = Math.min(joinDeadlineMs, jobDeadlineMs);
+      }
+
+      for (int threadIndex = 0; threadIndex < threadCount; threadIndex++) {
         BatchAutorouterThread autorouterThread = autorouterThreads[threadIndex];
 
-        // wait for the thread to finish
+        // Cancellation and the deadline are checked before every worker, and asking the
+        // workers to stop is what makes the wait short rather than merely bounded.
+        if (this.thread.isStopRequested() || System.currentTimeMillis() >= joinDeadlineMs) {
+          for (BatchAutorouterThread other : autorouterThreads) {
+            if (other != null && other.isAlive()) {
+              other.requestStop();
+            }
+          }
+        }
+
         try {
-          autorouterThread.join(TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+          // Bounded: the loop cannot outlive MAX_RACING_JOIN_ATTEMPTS even if the thread
+          // never terminates, so a hung worker degrades this pass instead of the process.
+          while (autorouterThread.isAlive() && System.currentTimeMillis() < joinDeadlineMs) {
+            autorouterThread.join(TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+            if (this.thread.isStopRequested()) {
+              // EVERY worker, not just the one currently being joined: the others keep
+              // routing until the outer loop reaches them, which on a stuck early worker
+              // is exactly when cancellation matters most.
+              for (BatchAutorouterThread other : autorouterThreads) {
+                if (other != null && other.isAlive()) {
+                  other.requestStop();
+                }
+              }
+            }
+          }
         } catch (InterruptedException e) {
           job.logError("Autorouter thread #" + p_pass_no + "." + ThreadIndexToLetter(threadIndex) + " was interrupted",
               e);
           this.thread.requestStop();
           break;
         }
+
+        if (autorouterThread.isAlive()) {
+          // Not a candidate. Reading its board is what this change exists to prevent.
+          job.logWarning("Router thread #" + p_pass_no + "." + ThreadIndexToLetter(threadIndex)
+              + " did not finish within the racing join budget; its board is left unread"
+              + " rather than sampled mid-write.");
+          continue;
+        }
+        threadFinished[threadIndex] = true;
 
         bh.add(autorouterThread.getBoard());
 
@@ -395,20 +670,40 @@ public class BatchAutorouter extends NamedAlgorithm {
         job.resourceUsage.maxMemoryUsed += autorouterThread.maxMemoryUsed;
       }
 
-      BatchAutorouterThread bestThread = autorouterThreads[0];
-      float bestScore = -Float.MAX_VALUE;
-
-      // Find the best thread
-      for (int i = 0; i < job.routerSettings.maxThreads; i++) {
-        BoardStatistics stats = autorouterThreads[i].getBoard().get_statistics();
-        float score = stats.getNormalizedScore(job.routerSettings.scoring);
-        if (score > bestScore) {
-          bestScore = score;
-          bestThread = autorouterThreads[i];
+      // ONE selection rule. This used to rank the threads twice, independently: this
+      // loop chose bestThread by score and decided progress from it, while the board
+      // actually adopted came from bh.restoreBestBoard(), which ranks by its own ordering
+      // and deduplicates by board hash. Nothing forced the two answers to agree, so the
+      // router could keep one thread's board and report another thread's counts -- and in
+      // a best-of-N search the selection rule IS the algorithm.
+      float[] scores = new float[autorouterThreads.length];
+      for (int i = 0; i < autorouterThreads.length; i++) {
+        if (!threadFinished[i]) {
+          // Do not even ask for the statistics of a live board.
+          continue;
         }
+        scores[i] = autorouterThreads[i]
+            .getBoard()
+            .get_statistics()
+            .getNormalizedScore(job.routerSettings.scoring);
       }
+      int winner = bestThreadIndexByScore(scores, threadFinished);
+      if (winner < 0) {
+        job.logError("The racing pass finished with no threads to choose from.", null);
+        this.air_line = null;
+        return PassOutcome.ABORTED;
+      }
+      BatchAutorouterThread bestThread = autorouterThreads[winner];
 
-      this.board = bh.restoreBestBoard();
+      job.logInfo("Racing pass #" + p_pass_no + ": thread "
+          + ThreadIndexToLetter(winner) + " won with score "
+          + FRLogger.formatScore(scores[winner],
+              bestThread.getBoard().get_statistics().connections.incompleteCount,
+              bestThread.getBoard().get_statistics().clearanceViolations.totalCount)
+          + " (" + autorouterThreads.length + " threads raced).");
+
+      // The board we keep and the counts we report now come from the same thread.
+      this.board = bestThread.getBoard();
       bh.clear();
 
       // Check if we made any progress
@@ -416,11 +711,16 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       // We are done with this pass
       this.air_line = null;
-      return anyProgress;
+      return anyProgress ? PassOutcome.PROGRESS : PassOutcome.NO_PROGRESS;
     } catch (Exception e) {
-      job.logError("Something went wrong during the auto-routing", e);
+      // ABORTED, not "no progress". Threads may have mutated their board copies before
+      // the throw, so this is the wreckage of a pass rather than a pass that finished
+      // with nothing left to do -- the defect-17 conflation, still live here because this
+      // path was dead code when that was fixed everywhere else.
+      job.logError("The racing pass was ended by an exception; treating it as aborted "
+          + "rather than as a completed pass with no progress.", e);
       this.air_line = null;
-      return false;
+      return PassOutcome.ABORTED;
     }
   }
 
@@ -428,7 +728,37 @@ public class BatchAutorouter extends NamedAlgorithm {
    * Auto-routes one ripup pass of all items of the board. Returns false, if the
    * board is already completely routed.
    */
-  private boolean autoroute_pass(int p_pass_no) {
+  /**
+   * Copies the running tallies of a pass into the counters object published to
+   * listeners. Was written out longhand at every publish point, which made the
+   * publish sites hard to tell apart from the routing logic around them.
+   */
+  private void refreshCounters(RouterCounters counters, int p_pass_no, int items_to_go_count,
+      int skipped, int ripped_item_count, int not_routed, int routed) {
+    counters.passCount = p_pass_no;
+    counters.queuedToBeRoutedCount = items_to_go_count;
+    counters.skippedCount = skipped;
+    counters.rippedCount = ripped_item_count;
+    counters.failedToBeRoutedCount = not_routed;
+    counters.routedCount = routed;
+    counters.incompleteCount = calculateIncompleteCount(board);
+  }
+
+  /** Per-net breakdown of what is still unconnected. Diagnostics only. */
+  private void logIncompleteDetails(int p_pass_no, DesignRulesChecker drc, int items_to_go_count) {
+    job.logDebug(() -> "Pass #" + p_pass_no + ": " + drc.getIncompleteCount() + " incompletes across "
+        + items_to_go_count + " items to route");
+    for (int netNo = 1; netNo <= board.rules.nets.max_net_no(); netNo++) {
+      int netIncompletes = drc.getIncompleteCount(netNo);
+      if (netIncompletes > 0) {
+        Net net = board.rules.nets.get(netNo);
+        String netName = (net != null) ? net.name : "net#" + netNo;
+        job.logDebug(() -> "  Net '" + netName + "' has " + netIncompletes + " incomplete(s)");
+      }
+    }
+  }
+
+  private PassOutcome autoroute_pass(int p_pass_no) {
     long passStartTime = System.currentTimeMillis();
     try {
       List<Item> autoroute_item_list = getAutorouteItems(this.board);
@@ -436,7 +766,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       // If there are no items to route, we're done
       if (autoroute_item_list.isEmpty()) {
         this.air_line = null;
-        return false;
+        return PassOutcome.NO_PROGRESS;
       }
 
       int items_to_go_count = autoroute_item_list.size();
@@ -459,16 +789,7 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       // Log incomplete details for debugging
       if (routerCounters.incompleteCount > 0) {
-        job.logDebug("Pass #" + p_pass_no + ": " + routerCounters.incompleteCount + " incompletes across "
-            + items_to_go_count + " items to route");
-        for (int netNo = 1; netNo <= board.rules.nets.max_net_no(); netNo++) {
-          int netIncompletes = tempDrc.getIncompleteCount(netNo);
-          if (netIncompletes > 0) {
-            Net net = board.rules.nets.get(netNo);
-            String netName = (net != null) ? net.name : "net#" + netNo;
-            job.logDebug("  Net '" + netName + "' has " + netIncompletes + " incomplete(s)");
-          }
-        }
+        logIncompleteDetails(p_pass_no, tempDrc, items_to_go_count);
       }
 
       this.fireBoardUpdatedEvent(stats, routerCounters, this.board);
@@ -481,15 +802,23 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       // Let's go through all items to route
       for (Item curr_item : autoroute_item_list) {
-        // If the user requested to stop the auto-router, we stop it
-        if (this.thread.is_stop_auto_router_requested()) {
+        // ROLE-AWARE, and it must stay that way -- see routingShouldStop().
+        //
+        // This method runs for TWO callers. For the main routing stage an auto-router stop
+        // means stop. For the optimiser's re-route it must NOT, because that state is the
+        // signal that routing has finished and the optimiser now owns the board. Using the
+        // raw is_stop_auto_router_requested() here made the optimiser queue ~30 items and
+        // route zero of them, forever.
+        if (routingShouldStop()) {
           break;
         }
 
         // Let's go through all nets of this item
         for (int i = 0; i < curr_item.net_count(); i++) {
-          // If the user requested to stop the auto-router, we stop it
-          if (this.thread.is_stop_auto_router_requested()) {
+          // The same check again, one level in -- and THIS is the one that actually
+          // disabled the optimiser. Fixing only the outer loop looked like a fix and
+          // changed nothing measurable, because control broke out here instead.
+          if (routingShouldStop()) {
             break;
           }
 
@@ -526,83 +855,81 @@ public class BatchAutorouter extends NamedAlgorithm {
                 rippedNets.append(rippedItem.get_net_no(netIx));
               }
               int ripupCost = ripped_item_costs.getOrDefault(rippedItem, -1);
+              final int sourceNetIndex = i;
               FRLogger.trace(
                   "BatchAutorouter.autoroute_pass",
                   "compare_trace_ripped_item",
-                  "source_item=" + curr_item.get_id_no()
-                      + ", source_net=" + curr_item.get_net_no(i)
+                  () -> "source_item=" + curr_item.get_id_no()
+                      + ", source_net=" + curr_item.get_net_no(sourceNetIndex)
                       + ", ripped_id=" + rippedItem.get_id_no()
                       + ", ripped_type=" + rippedItem.getClass().getSimpleName()
                       + ", ripped_net_count=" + rippedItem.net_count()
                       + ", ripped_nets=" + rippedNets
                       + ", ripup_cost=" + ripupCost,
-                  "Net #" + curr_item.get_net_no(i) + ",Item #" + curr_item.get_id_no(),
-                  getImpactedPoints(rippedItem));
+                  () -> "Net #" + curr_item.get_net_no(sourceNetIndex) + ",Item #" + curr_item.get_id_no(),
+                  () -> getImpactedPoints(rippedItem));
             }
           }
-          if (FRLogger.isTraceEnabled()) {
-            DesignRulesChecker innerDrc = new DesignRulesChecker(board, null);
-            innerDrc.calculateAllIncompletes();
-            int tempIncomp = innerDrc.getIncompleteCount();
-            int tempNetIncomp = innerDrc.getIncompleteCount(curr_item.get_net_no(i));
-            int netItemsAfter = board.get_connectable_items(curr_item.get_net_no(i)).size();
-            int maxItemId = board.communication.id_no_generator.max_generated_no();
-            FRLogger.trace(
-                "BatchAutorouter.autoroute_pass",
-                "compare_trace_route_item",
-                "Routing " + curr_item.getClass().getSimpleName() + " -> result=" + autorouterResult.state
+          // The most expensive logging-only work in the tree: a full board DRC
+          // recomputation, per routed item, per pass, solely to build this message.
+          //
+          // It used to sit behind if (FRLogger.isTraceEnabled()) -- twice, the inner
+          // check being redundant with the outer. That guard had to stay while the
+          // message was an already-built String, because a guard is the only thing that
+          // defers STATEMENTS; a parameterised "{}" message defers toString() and would
+          // not have helped here at all.
+          //
+          // The whole computation now lives inside the message supplier, which is
+          // strictly better than the guard it replaces. Nothing runs unless something
+          // consumes the message, AND the debugger still reaches this breakpoint -- the
+          // guard suppressed DebugControl.check() along with the DRC, which is the defect
+          // F1 exists to fix. When single-step IS active the DRC runs per item, which is
+          // what a person who asked to step through the router is asking for.
+          final int netIndex = i;
+          final int netItemsBeforeRouting = netItemsBefore;
+          final int rippedCount = ripped_item_list.size();
+          FRLogger.trace(
+              "BatchAutorouter.autoroute_pass",
+              "compare_trace_route_item",
+              () -> {
+                // Recompute the NET this move was for, not the entire board.
+                //
+                // This built a throwaway DesignRulesChecker and called
+                // calculateAllIncompletes() -- which walks every item on the board and
+                // rebuilds the incomplete set for every net -- once per routed item. For a
+                // message about ONE item on ONE net. That is O(items) work per item, and
+                // the per-net API that would have avoided it was unreachable from a fresh
+                // checker: recalculateNetIncompletes() finds net_incompletes == null and
+                // falls straight back to the full sweep. The source even calls it a
+                // catch-22.
+                //
+                // The escape is that the pass ALREADY built a checker a few lines up, for
+                // routerCounters.incompleteCount, and its array is populated -- so the
+                // per-net path works on it. One net instead of the board.
+                //
+                // Semantics, stated rather than glossed: the per-net figure is exact and
+                // current for the net just routed, which is what this message is about.
+                // The total is now "as at pass start, updated for the nets touched since"
+                // rather than a fresh whole-board count. For a per-item diagnostic that is
+                // the more useful of the two readings, and it is the one that does not cost
+                // a board sweep per item.
+                int netNo = curr_item.get_net_no(netIndex);
+                tempDrc.recalculateNetIncompletes(netNo);
+                int tempNetIncomp = tempDrc.getIncompleteCount(netNo);
+                int tempIncomp = tempDrc.getIncompleteCount();
+                int netItemsAfter = board.get_connectable_items(netNo).size();
+                int maxItemId = board.communication.id_no_generator.max_generated_no();
+                return "Routing " + curr_item.getClass().getSimpleName() + " -> result=" + autorouterResult.state
                     + ", details=" + autorouterResult.details
                     + ", incompletes=" + tempIncomp + ", netIncomplete=" + tempNetIncomp
-                    + ", ripped=" + ripped_item_list.size() + ", netItems="
-                    + netItemsBefore + "->" + netItemsAfter
-                    + ", maxItemId=" + maxItemId,
-                "Net #" + curr_item.get_net_no(i) + ",Item #" + curr_item.get_id_no() + ",Type="
-                    + curr_item.getClass().getSimpleName(),
-                getImpactedPoints(curr_item));
-          }
+                    + ", ripped=" + rippedCount + ", netItems="
+                    + netItemsBeforeRouting + "->" + netItemsAfter
+                    + ", maxItemId=" + maxItemId;
+              },
+              () -> "Net #" + curr_item.get_net_no(netIndex) + ",Item #" + curr_item.get_id_no() + ",Type="
+                  + curr_item.getClass().getSimpleName(),
+              () -> getImpactedPoints(curr_item));
 
-          if (curr_item.get_net_no(i) == 94) {
-            FRLogger.trace(
-                "BatchAutorouter.autoroute_pass",
-                "compare_trace_dump_net_items",
-                "Dump net 94 items",
-                "Net #94",
-                new Point[0]);
-            for (Item nItem : board.get_connectable_items(94)) {
-              if (nItem instanceof Trace) {
-                Trace t = (Trace) nItem;
-                FRLogger.trace(
-                    "BatchAutorouter.autoroute_pass",
-                    "compare_trace_dump_net_item",
-                    "Trace layer=" + t.get_layer() + " corners=" + t.first_corner() + " to " + t.last_corner(),
-                    "Net #94,Item #" + t.get_id_no() + ",Type=Trace",
-                    new Point[] { t.first_corner(), t.last_corner() });
-              } else if (nItem instanceof Via) {
-                Via v = (Via) nItem;
-                FRLogger.trace(
-                    "BatchAutorouter.autoroute_pass",
-                    "compare_trace_dump_net_item",
-                    "Via center=" + v.get_center(),
-                    "Net #94,Item #" + v.get_id_no() + ",Type=Via",
-                    new Point[] { v.get_center() });
-              } else if (nItem instanceof Pin) {
-                Pin p = (Pin) nItem;
-                FRLogger.trace(
-                    "BatchAutorouter.autoroute_pass",
-                    "compare_trace_dump_net_item",
-                    "Pin center=" + p.get_center() + " name=" + p.name() + " comp=" + p.component_name(),
-                    "Net #94,Item #" + p.get_id_no() + ",Type=Pin",
-                    new Point[] { p.get_center() });
-              } else {
-                FRLogger.trace(
-                    "BatchAutorouter.autoroute_pass",
-                    "compare_trace_dump_net_item",
-                    "Item " + nItem.getClass().getSimpleName(),
-                    "Net #94,Item #" + nItem.get_id_no() + ",Type=" + nItem.getClass().getSimpleName(),
-                    getImpactedPoints(nItem));
-              }
-            }
-          }
 
           if (autorouterResult.state == AutorouteAttemptState.ROUTED) {
             // The item was successfully routed
@@ -619,7 +946,7 @@ public class BatchAutorouter extends NamedAlgorithm {
             // Record the failure
             board.failureLog.recordFailure(curr_item, p_pass_no, autorouterResult.state, autorouterResult.details);
 
-            job.logDebug("Autorouter " + autorouterResult.details);
+            job.logDebug(() -> "Autorouter " + autorouterResult.details);
             // Log details when we're down to last few items or item has many failures
             int failureCount = board.failureLog.getFailureCount(curr_item);
             if (items_to_go_count <= 5 || failureCount >= 3) {
@@ -634,13 +961,8 @@ public class BatchAutorouter extends NamedAlgorithm {
 
           if (shouldFireBoardUpdate()) {
             BoardStatistics boardStatistics = board.get_statistics();
-            routerCounters.passCount = p_pass_no;
-            routerCounters.queuedToBeRoutedCount = items_to_go_count;
-            routerCounters.skippedCount = skipped;
-            routerCounters.rippedCount = ripped_item_count;
-            routerCounters.failedToBeRoutedCount = not_routed;
-            routerCounters.routedCount = routed;
-            routerCounters.incompleteCount = calculateIncompleteCount(board);
+            refreshCounters(routerCounters, p_pass_no, items_to_go_count, skipped,
+                ripped_item_count, not_routed, routed);
             this.fireBoardUpdatedEvent(boardStatistics, routerCounters, this.board);
           }
         }
@@ -650,9 +972,9 @@ public class BatchAutorouter extends NamedAlgorithm {
       FRLogger.trace(
           "BatchAutorouter.autoroute_pass",
           "compare_trace_remove_tails",
-          "Incompletes before remove_tails=" + incompletesBefore,
-          "Autorouter pass #" + p_pass_no,
-          new Point[0]);
+          () -> "Incompletes before remove_tails=" + incompletesBefore,
+          () -> "Autorouter pass #" + p_pass_no,
+          () -> Point.EMPTY);
 
       if (this.remove_unconnected_vias) {
         remove_tails(Item.StopConnectionOption.NONE);
@@ -664,19 +986,14 @@ public class BatchAutorouter extends NamedAlgorithm {
       FRLogger.trace(
           "BatchAutorouter.autoroute_pass",
           "compare_trace_remove_tails",
-          "Incompletes after remove_tails=" + incompletesAfter,
-          "Autorouter pass #" + p_pass_no,
-          new Point[0]);
+          () -> "Incompletes after remove_tails=" + incompletesAfter,
+          () -> "Autorouter pass #" + p_pass_no,
+          () -> Point.EMPTY);
 
       // Fire final update for this pass
       BoardStatistics boardStatistics = board.get_statistics();
-      routerCounters.passCount = p_pass_no;
-      routerCounters.queuedToBeRoutedCount = items_to_go_count;
-      routerCounters.skippedCount = skipped;
-      routerCounters.rippedCount = ripped_item_count;
-      routerCounters.failedToBeRoutedCount = not_routed;
-      routerCounters.routedCount = routed;
-      routerCounters.incompleteCount = calculateIncompleteCount(board);
+      refreshCounters(routerCounters, p_pass_no, items_to_go_count, skipped,
+          ripped_item_count, not_routed, routed);
       this.fireBoardUpdatedEvent(boardStatistics, routerCounters, this.board);
 
       long passDuration = System.currentTimeMillis() - passStartTime;
@@ -685,11 +1002,11 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       // We are done with this pass
       this.air_line = null;
-      return routed > 0 || not_routed > 0;
+      return (routed > 0 || not_routed > 0) ? PassOutcome.PROGRESS : PassOutcome.NO_PROGRESS;
     } catch (Exception e) {
       job.logError("Something went wrong during the auto-routing", e);
       this.air_line = null;
-      return false;
+      return PassOutcome.ABORTED;
     }
   }
 
@@ -793,7 +1110,7 @@ public class BatchAutorouter extends NamedAlgorithm {
           againstCosts);
     }
 
-    job.logDebug("Checking fanout pre-pass. settings.fanout.enabled=" + this.settings.isFanoutEnabled() + ", smd_pins=" + this.board.get_smd_pins().size());
+    job.logDebug(() -> "Checking fanout pre-pass. settings.fanout.enabled=" + this.settings.isFanoutEnabled() + ", smd_pins=" + this.board.get_smd_pins().size());
     // Run SMD fanout pre-pass when the board has SMD pins and fanout is enabled
     if (this.settings.isFanoutEnabled()) {
       if (this.board.get_smd_pins().isEmpty()) {
@@ -821,6 +1138,10 @@ public class BatchAutorouter extends NamedAlgorithm {
              + pinsToFanout + " of " + this.board.get_smd_pins().size() + " SMD pins needing fanout ("
              + alreadyConnectedAtStart + " already connected, "
              + (this.board.get_smd_pins().size() - netConnectedSmdPins) + " netless).");
+        // Hand fanout the job's deadline so it lives inside the same envelope every other
+        // stage does; without it the stage had no clock of its own by default.
+        Long fanoutJobDeadlineMs =
+            (this.job != null && this.job.timeoutAt != null) ? this.job.timeoutAt.toEpochMilli() : null;
         BatchFanout.FanoutRunSummary fanoutSummary = BatchFanout.fanout_board(this.board, this.settings, this.thread,
             status -> {
           fanoutPeakHeapMbObserved[0] = Math.max(fanoutPeakHeapMbObserved[0], sampleHeapUsageMb());
@@ -850,7 +1171,7 @@ public class BatchAutorouter extends NamedAlgorithm {
                 status.ripupCosts());
             job.logInfo(fanoutMessage);
           }
-        });
+        }, fanoutJobDeadlineMs);
         this.fanoutTimedOut = fanoutSummary.isTimedOut();
 
         float fanoutCpuSecondsEnd = sampleCurrentThreadCpuSeconds();
@@ -874,7 +1195,7 @@ public class BatchAutorouter extends NamedAlgorithm {
         fanoutPeakHeapMb = Math.max(fanoutPeakHeapMb, getPeakHeapMbSnapshot(job));
         BatchFanout.EscapeStatistics finalEscape = fanoutSummary.escapeStatistics();
         String fanoutCompletionStatus = fanoutSummary.isTimedOut() ? "completed with timeout:"
-            : (this.thread.is_stop_auto_router_requested() ? "interrupted:" : "completed:");
+            : (routingShouldStop() ? "interrupted:" : "completed:");
         String fanoutSummaryMessage = String.format(java.util.Locale.US,
             "Fanout stage %s started with %d total SMD pins, completed in %.2f seconds, escaped pins: %d/%d (%.1f%%), using %.2f total CPU seconds, %.2f GB total allocated, and %.1f MB peak heap usage.",
             fanoutCompletionStatus,
@@ -898,6 +1219,14 @@ public class BatchAutorouter extends NamedAlgorithm {
     }
     continueAutorouting = isRouterEnabled;
 
+    // The auto-routing stage had no deadline of its own. It reacted to the job only AFTER
+    // the outer watchdog had already flipped it to TIMED_OUT -- which is the amputation, not
+    // an orderly finish. Fanout and the optimizer both stop just inside the job deadline and
+    // hand back a complete pass; this stage now does the same, by the same rule.
+    Long autorouteJobDeadlineMs =
+        (this.job != null && this.job.timeoutAt != null) ? this.job.timeoutAt.toEpochMilli() : null;
+    Long autorouteDeadlineMs =
+        StageDeadline.compute(null, autorouteJobDeadlineMs, System.currentTimeMillis());
     int currentPass = 1;
     int consecutiveNoImprovementPasses = 0;
     boolean fanoutRecoveryApplied = false;
@@ -905,28 +1234,25 @@ public class BatchAutorouter extends NamedAlgorithm {
     float globalBestScore = Float.NEGATIVE_INFINITY; // best score seen across all passes
     int passOfBestScore = 0;                         // pass where globalBestScore was achieved
     int incompleteCountAtBestScore = 0;              // incomplete count when globalBestScore was recorded
-    // Track board hashes that have already been routed. If the board does not change between
-    // two consecutive passes (same hash at pass start), the router is making no progress and
-    // would produce identical decisions with identical ripup budgets — stop immediately rather
-    // than waiting for the full stagnation window. This mirrors the v1.9 behaviour and catches
-    // the degenerate case where plane-net items repeatedly fail or are inserted+removed each
-    // pass without updating the board state.
-    Set<String> alreadyRoutedBoardHashes = new java.util.HashSet<>();
-    while (continueAutorouting && !this.thread.is_stop_auto_router_requested()) {
+    while (continueAutorouting && !routingShouldStop()) {
       if (job != null && job.state == RoutingJobState.TIMED_OUT) {
         this.thread.request_stop_auto_router();
       }
 
+      // Checked before starting a pass rather than during one: a pass that has begun is
+      // allowed to finish, so the board handed on is whole. Stopping here means the stage
+      // ends of its own accord with time still on the job clock, instead of being cut off.
+      if (autorouteDeadlineMs != null && System.currentTimeMillis() >= autorouteDeadlineMs) {
+        if (job != null) {
+          job.logInfo("Auto-routing stage stopping before pass #" + currentPass
+              + ": the job's remaining time is spent.");
+        }
+        thread.request_stop_auto_router();
+        break;
+      }
+
       String currentBoardHash = this.board.get_hash();
 
-      // Same-hash stop disabled because ripup budgets and random seeds change per-pass, making progress possible in later passes.
-      // if (alreadyRoutedBoardHashes.contains(currentBoardHash)) {
-      //   job.logInfo("Board state has not changed since pass #" + (currentPass - 1)
-      //       + " (hash " + currentBoardHash + "). The auto-router cannot make further progress; stopping.");
-      //   thread.request_stop_auto_router();
-      //   break;
-      // }
-      // alreadyRoutedBoardHashes.add(currentBoardHash);
 
       if (this.settings.maxPasses != null && this.settings.maxPasses > 0 && currentPass > this.settings.maxPasses) {
         thread.request_stop_auto_router();
@@ -945,14 +1271,37 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       FRLogger.traceEntry("BatchAutorouter.autoroute_pass #" + currentPass + " on board '" + currentBoardHash + "'");
 
-      continueAutorouting = autoroute_pass(currentPass);
+      if (Boolean.TRUE.equals(job.routerSettings.racingEnabled)
+          && job.routerSettings.maxThreads <= 1 && !racingMismatchWarned) {
+        racingMismatchWarned = true;
+        // Conflicting flags never resolve silently: racing was requested but the router
+        // width is 1, and racing only exists above width 1. Racing loses, and this line
+        // is why.
+        job.logWarning("racing_enabled is set but --router.max_threads is 1 -- racing "
+            + "needs a router width above 1. Routing proceeds single-threaded; raise "
+            + "--router.max_threads or drop racing_enabled to silence this.");
+      }
+      PassOutcome passOutcome =
+          shouldRace(Boolean.TRUE.equals(job.routerSettings.racingEnabled),
+              job.routerSettings.maxThreads)
+              ? autoroute_pass_multi_thread(currentPass)
+              : autoroute_pass(currentPass);
+      continueAutorouting = passOutcome.shouldContinue();
+      if (passOutcome.isAbnormal()) {
+        this.endedAbnormally = true;
+        // The pass did not finish -- it was cut short by an exception. Say so
+        // explicitly: a partially routed board reported as a completed one is how a
+        // defect gets mistaken for a hard board.
+        job.logError("Auto-routing pass #" + currentPass
+            + " was aborted by an error; the board is only partially routed.", null);
+      }
 
       BoardStatistics boardStatisticsAfter = new BoardStatistics(this.board);
       float boardScoreAfter = boardStatisticsAfter.getNormalizedScore(job.routerSettings.scoring);
 
-      if ((bh.size() >= STOP_AT_PASS_MINIMUM) || (this.thread.is_stop_auto_router_requested())) {
+      if ((bh.size() >= STOP_AT_PASS_MINIMUM) || (routingShouldStop())) {
         if (((currentPass % STOP_AT_PASS_MODULO == 0) && (currentPass >= STOP_AT_PASS_MINIMUM))
-            || (this.thread.is_stop_auto_router_requested())) {
+            || (routingShouldStop())) {
           // Check if the score improved compared to the previous passes, restore a
           // previous board if not. Use strict ">" so that equally-scored boards do NOT
           // trigger a restore — if every board has the same (possibly zero) score the old
@@ -984,9 +1333,7 @@ public class BatchAutorouter extends NamedAlgorithm {
             // Reset the same-hash set after a board restore: the restored board will be
             // routed with a higher ripup budget on subsequent passes, so earlier routing
             // decisions from the same hash may no longer apply.
-            alreadyRoutedBoardHashes.clear();
-            job.logDebug(
-                "Restoring an earlier board that has the score of "
+            job.logDebug("Restoring an earlier board that has the score of "
                     + FRLogger.formatScore(boardScoreAfter,
                         boardStatisticsAfter.connections.incompleteCount,
                         boardStatisticsAfter.clearanceViolations.totalCount)
@@ -1002,6 +1349,17 @@ public class BatchAutorouter extends NamedAlgorithm {
           currentPass, currentBoardHash, autorouter_pass_duration,
           FRLogger.formatScore(boardScoreAfter, boardStatisticsAfter.connections.incompleteCount,
               boardStatisticsAfter.clearanceViolations.totalCount));
+      if (job.startedAt != null) {
+        // The same elapsed/limit pair the GUI shows. A headless user watching a terminal
+        // has exactly the same question -- is this alive, and how much longer.
+        long elapsedSeconds =
+            java.time.Duration.between(job.startedAt, java.time.Instant.now()).getSeconds();
+        passCompletedMessage += " ["
+            + app.freerouting.core.RoutingProgress.format(elapsedSeconds,
+                app.freerouting.util.TextManager.parseTimespanString(
+                    job.routerSettings.jobTimeoutString))
+            + "]";
+      }
       if (job.resourceUsage.cpuTimeUsed > 0) {
         passCompletedMessage += String.format(java.util.Locale.US, ", using %.2f CPU seconds and the job allocated %.2f GB of memory so far.",
             job.resourceUsage.cpuTimeUsed, job.resourceUsage.maxMemoryUsed / 1024.0f);
@@ -1018,24 +1376,29 @@ public class BatchAutorouter extends NamedAlgorithm {
       for (int netNo = 1; netNo <= this.board.rules.nets.max_net_no(); netNo++) {
         int netIncomplete = tempDrc.getIncompleteCount(netNo);
         if (netIncomplete > 0) {
+          final int reportedPass = currentPass;
+          final int reportedNet = netNo;
+          final int reportedIncomplete = netIncomplete;
           FRLogger.trace(
               "BatchAutorouter.autoroute_pass",
               "compare_unrouted_net",
-              "pass=" + currentPass + ", net=" + netNo + ", incomplete=" + netIncomplete,
-              "Net #" + netNo,
-              new Point[0]);
+              () -> "pass=" + reportedPass + ", net=" + reportedNet + ", incomplete=" + reportedIncomplete,
+              () -> "Net #" + reportedNet,
+              () -> Point.EMPTY);
           if (!perNetBreakdown.isEmpty()) {
             perNetBreakdown.append(',');
           }
           perNetBreakdown.append(netNo).append('=').append(netIncomplete);
         }
       }
+      final int summaryPass = currentPass;
+      final var breakdown = perNetBreakdown;
       FRLogger.trace("BatchAutorouter.autoroute_pass", "compare_unrouted_breakdown",
-          "pass=" + currentPass
+          () -> "pass=" + summaryPass
               + ", total=" + tempDrc.getIncompleteCount()
-              + ", breakdown=" + perNetBreakdown,
-          "",
-          new Point[0]);
+              + ", breakdown=" + breakdown,
+          () -> "",
+          () -> Point.EMPTY);
 
       if (this.settings.save_intermediate_stages) {
         fireBoardSnapshotEvent(this.board);
@@ -1075,7 +1438,6 @@ public class BatchAutorouter extends NamedAlgorithm {
             lastBestScore = boardScoreAfter;
             consecutiveNoImprovementPasses = 0;
             fanoutRecoveryApplied = true;
-            alreadyRoutedBoardHashes.clear();
             job.logDebug("Applied one-time fanout recovery cleanup (removed fanout tails/vias). "
                 + "Incompletes: " + incompletesBeforeRecovery + " -> "
                 + boardStatisticsAfter.connections.incompleteCount + ".");
@@ -1130,7 +1492,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       }
 
       // check if there are still unrouted items
-      if (continueAutorouting && !this.thread.is_stop_auto_router_requested()) {
+      if (continueAutorouting && !routingShouldStop()) {
         currentPass++;
       }
     }
@@ -1146,7 +1508,7 @@ public class BatchAutorouter extends NamedAlgorithm {
         BoardStatistics currentStats = new BoardStatistics(this.board);
         this.board = bestBoard;
         BoardStatistics bestStats = new BoardStatistics(this.board);
-        job.logDebug("The final board state (score "
+        job.logDebug(() -> "The final board state (score "
             + FRLogger.formatScore(currentFinalScore,
                 currentStats.connections.incompleteCount,
                 currentStats.clearanceViolations.totalCount)
@@ -1161,7 +1523,7 @@ public class BatchAutorouter extends NamedAlgorithm {
     job.board = this.board;
 
     boolean wasRouterRun = this.settings.getRunRouter() && (this.settings.maxPasses == null || this.settings.maxPasses >= 0);
-    if (wasRouterRun && !(this.remove_unconnected_vias || continueAutorouting || this.thread.is_stop_auto_router_requested())) {
+    if (wasRouterRun && !(this.remove_unconnected_vias || continueAutorouting || routingShouldStop())) {
       // clean up the route if the board is completed and if fanout is used.
       remove_tails(Item.StopConnectionOption.NONE);
     }
@@ -1172,7 +1534,7 @@ public class BatchAutorouter extends NamedAlgorithm {
     PerformanceProfiler.printResults();
     PerformanceProfiler.reset();
 
-    if (!this.thread.is_stop_auto_router_requested()) {
+    if (!routingShouldStop()) {
       this.fireTaskStateChangedEvent(new TaskStateChangedEvent(this, TaskState.FINISHED,
           currentPass, this.board.get_hash()));
     } else {
@@ -1184,64 +1546,71 @@ public class BatchAutorouter extends NamedAlgorithm {
           currentPass, this.board.get_hash()));
     }
 
-    return !this.thread.is_stop_auto_router_requested();
+    // Role-aware for the same reason: for the optimiser's re-route, an auto-router stop
+    // does not mean this run was interrupted.
+    return !routingShouldStop();
+  }
+
+
+  /**
+   * Names every track on the finished board that is narrower than the board's own minimum.
+   *
+   * <p>Fanout necks down at pin exits to escape fine-pitch packages, and on boards where the
+   * net width equals the board minimum there is no legal narrower width -- so it can leave a
+   * track the board declares unmanufacturable. That was silent, and the run reported zero
+   * violations while carrying them. Measured on public boards: one wire of ninety-five at
+   * 0.225 mm against a 0.30 mm minimum, and thirty-five at 0.1124 against 0.15.
+   *
+   * <p>Built from the BOARD, not from the routing attempts. The router tries a neckdown,
+   * shoves, and usually rips it out again; reporting per attempt produced nineteen warnings
+   * for one surviving track, and a warning that is usually wrong is one people stop reading.
+   *
+   * @return a human-readable report, or null when every track meets the minimum
+   */
+  public static String buildUnderMinimumWidthReport(app.freerouting.board.BasicBoard board) {
+    int min_half_width = board.rules.get_min_trace_half_width();
+    java.util.Map<Integer, Integer> narrowest = new java.util.TreeMap<>();
+    java.util.Map<Integer, Integer> counts = new java.util.TreeMap<>();
+    for (app.freerouting.board.Item item : board.get_items()) {
+      if (!(item instanceof Trace trace)) {
+        continue;
+      }
+      int half_width = trace.get_half_width();
+      if (half_width >= min_half_width) {
+        continue;
+      }
+      for (int i = 0; i < trace.net_count(); i++) {
+        int net_no = trace.get_net_no(i);
+        counts.merge(net_no, 1, Integer::sum);
+        narrowest.merge(net_no, half_width, Math::min);
+      }
+    }
+    if (counts.isEmpty()) {
+      return null;
+    }
+    int total = counts.values().stream().mapToInt(Integer::intValue).sum();
+    StringBuilder sb = new StringBuilder();
+    sb.append(total).append(total == 1 ? " track is" : " tracks are")
+        .append(" narrower than the board minimum of ").append(min_half_width * 2)
+        .append(" (board units). The board may not be manufacturable as routed:");
+    for (java.util.Map.Entry<Integer, Integer> e : counts.entrySet()) {
+      sb.append(System.lineSeparator())
+          .append("  net ").append(e.getKey())
+          .append(": ").append(e.getValue()).append(e.getValue() == 1 ? " track" : " tracks")
+          .append(", narrowest ").append(narrowest.get(e.getKey()) * 2);
+    }
+    return sb.toString();
   }
 
   private String buildUnroutedConnectionsReport() {
-    DesignRulesChecker tempDrc = new DesignRulesChecker(this.board, null);
-    tempDrc.calculateAllIncompletes();
-    AirLine[] airlines = tempDrc.getAllAirlines();
-
-    if (airlines == null || airlines.length == 0) {
-      return "  (no unrouted connections found)";
-    }
-
-    // Group airlines by net name for a cleaner report
-    Map<String, List<String>> byNet = new LinkedHashMap<>();
-    for (AirLine al : airlines) {
-      String netName = al.net != null ? al.net.name : "(unknown net)";
-      String fromDesc = describeItem(al.from_item);
-      String toDesc   = describeItem(al.to_item);
-      byNet.computeIfAbsent(netName, k -> new ArrayList<>())
-           .add("    - " + fromDesc + "  ->  " + toDesc);
-    }
-
-    StringBuilder sb = new StringBuilder();
-    for (Map.Entry<String, List<String>> entry : byNet.entrySet()) {
-      int count = entry.getValue().size();
-      sb.append("  Net '").append(entry.getKey()).append("' (")
-        .append(count).append(" unrouted connection").append(count == 1 ? "" : "s").append("):\n");
-      for (String line : entry.getValue()) {
-        sb.append(line).append('\n');
-      }
-    }
-    return sb.toString().stripTrailing();
+    // Shared with the final run report (FinalRunReport.unroutedSection) so the mid-run
+    // stagnation log and the file a user keeps are the same text by construction.
+    return app.freerouting.core.FinalRunReport.unroutedSection(this.board);
   }
 
-  /**
-   * Returns a short, user-friendly description of a board item suitable for the
-   * stagnation report.  For pins the format is {@code ComponentName-PinName}
-   * (e.g. {@code J2-A3}); for all other item types a generic fallback is used.
-   */
+  /** Delegates to the shared formatter; other logging call sites in this class use it. */
   private String describeItem(Item item) {
-    if (item instanceof Pin pin) {
-      try {
-        app.freerouting.board.Component comp = board.components.get(pin.get_component_no());
-        if (comp != null) {
-          app.freerouting.core.Package pkg = comp.get_package();
-          if (pkg != null) {
-            app.freerouting.core.Package.Pin pkgPin = pkg.get_pin(pin.pin_no);
-            if (pkgPin != null) {
-              return comp.name + "-" + pkgPin.name;
-            }
-          }
-          return comp.name + " (pin #" + pin.pin_no + ")";
-        }
-      } catch (Exception e) {
-        // fall through to generic
-      }
-    }
-    return item != null ? item.toString() : "(unknown)";
+    return app.freerouting.core.FinalRunReport.describeItem(this.board, item);
   }
 
   private void remove_tails(Item.StopConnectionOption p_stop_connection_option) {
@@ -1327,11 +1696,15 @@ public class BatchAutorouter extends NamedAlgorithm {
       // Update the changed area of the board
       if (autoroute_result.state == AutorouteAttemptState.ROUTED) {
         int maxItemIdBeforeOpt = board.communication.id_no_generator.max_generated_no();
-        FRLogger.trace("compare_trace_opt_changed_area_before net=" + p_route_net_no + ", maxItemId=" + maxItemIdBeforeOpt);
+        if (FRLogger.isTraceEnabled()) {
+          FRLogger.trace("compare_trace_opt_changed_area_before net=" + p_route_net_no + ", maxItemId=" + maxItemIdBeforeOpt);
+        }
         board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, autoroute_control.trace_costs,
             this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
         int maxItemIdAfterOpt = board.communication.id_no_generator.max_generated_no();
-        FRLogger.trace("compare_trace_opt_changed_area_after net=" + p_route_net_no + ", maxItemId=" + maxItemIdAfterOpt + ", delta=" + (maxItemIdAfterOpt - maxItemIdBeforeOpt));
+        if (FRLogger.isTraceEnabled()) {
+          FRLogger.trace("compare_trace_opt_changed_area_after net=" + p_route_net_no + ", maxItemId=" + maxItemIdAfterOpt + ", delta=" + (maxItemIdAfterOpt - maxItemIdBeforeOpt));
+        }
       }
 
       if ((autoroute_result.state == AutorouteAttemptState.FAILED
@@ -1360,8 +1733,24 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       return autoroute_result;
     } catch (Exception e) {
-      FRLogger.error("Error during routing passes", e);
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED);
+      // Name the item. "Error during routing passes" identifies nothing, and on a board
+      // with hundreds of nets an unattributed stack trace cannot be turned into a
+      // reproduction. describeItem gives the component-pin form (e.g. J2-A3).
+      //
+      // Rethrow. By the time this fires, items may already have been ripped or inserted,
+      // so the board is half-mutated -- and returning FAILED here presents that as ordinary
+      // congestion, letting the pass report PROGRESS, leaving endedAbnormally() false, and
+      // allowing the scheduler to optimize and persist the wreckage.
+      //
+      // autoroute_pass already maps a propagated exception to PassOutcome.ABORTED, so this
+      // needs no new attempt state and no audit of AutorouteAttemptState's comparison
+      // sites. I previously costed that expensive route and declined it without looking
+      // for this one.
+      FRLogger.error("Auto-routing of item " + describeItem(p_item) + " (net " + p_route_net_no
+          + ") failed with an exception; aborting the pass, because the board may be"
+          + " partially mutated and must not be presented as a routing result.", e);
+      throw new RuntimeException(
+          "Auto-routing of item " + describeItem(p_item) + " failed", e);
     }
   }
 
@@ -1757,9 +2146,5 @@ public class BatchAutorouter extends NamedAlgorithm {
     return null;
   }
 
-  private int calculateIncompleteCount(RoutingBoard board) {
-    DesignRulesChecker tempDrc = new DesignRulesChecker(board, null);
-    tempDrc.calculateAllIncompletes();
-    return tempDrc.getIncompleteCount();
-  }
+
 }

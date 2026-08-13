@@ -94,7 +94,7 @@ public class VersionChecker implements Runnable {
             ? latestVersion.substring(1)
             : latestVersion;
 
-        if (!cleanCurrent.equalsIgnoreCase(cleanLatest)) {
+        if (isNewerVersion(cleanCurrent, cleanLatest)) {
           FRLogger.info("New version available: " + latestVersion);
         } else {
           FRLogger.debug("No new version available. Current version is up to date: " + currentVersion);
@@ -105,5 +105,61 @@ public class VersionChecker implements Runnable {
     } catch (Exception e) {
       FRLogger.warn("Failed to parse version check response: " + e.getMessage());
     }
+  }
+
+  /**
+   * Whether {@code latest} is genuinely newer than {@code current}.
+   *
+   * <p>This used to be a string inequality, so a build AHEAD of the newest release
+   * announced that release as an upgrade: a fork on {@code v2.3.1-SNAPSHOT} told every
+   * user, on every run, "New version available: v2.3.0". It lands in the first ten lines
+   * a new user sees, and it teaches them this program's output is not to be trusted.
+   *
+   * <p>A {@code -SNAPSHOT} suffix compares as its base version: a local build of 2.3.1 is
+   * not behind the 2.3.1 release, and is behind 2.3.2. When either side cannot be parsed
+   * the answer is false — saying nothing beats claiming an upgrade that may not exist.
+   */
+  static boolean isNewerVersion(String current, String latest) {
+    int[] c = parseVersion(current);
+    int[] l = parseVersion(latest);
+    if (c == null || l == null) {
+      return false;
+    }
+    for (int i = 0; i < Math.max(c.length, l.length); i++) {
+      int cv = (i < c.length) ? c[i] : 0;
+      int lv = (i < l.length) ? l[i] : 0;
+      if (lv != cv) {
+        return lv > cv;
+      }
+    }
+    return false;
+  }
+
+  /** Numeric segments of a version, or null when it is not a version at all. */
+  private static int[] parseVersion(String version) {
+    if (version == null) {
+      return null;
+    }
+    String cleaned = version.trim();
+    if (cleaned.startsWith("v") || cleaned.startsWith("V")) {
+      cleaned = cleaned.substring(1);
+    }
+    int dash = cleaned.indexOf('-');
+    if (dash >= 0) {
+      cleaned = cleaned.substring(0, dash);
+    }
+    if (cleaned.isEmpty()) {
+      return null;
+    }
+    String[] parts = cleaned.split("\\.");
+    int[] out = new int[parts.length];
+    for (int i = 0; i < parts.length; i++) {
+      try {
+        out[i] = Integer.parseInt(parts[i]);
+      } catch (NumberFormatException e) {
+        return null;
+      }
+    }
+    return out;
   }
 }

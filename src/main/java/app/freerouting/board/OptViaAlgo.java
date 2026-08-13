@@ -32,7 +32,9 @@ public class OptViaAlgo {
       return false;
     }
     if (p_max_recursion_depth <= 0) {
-      FRLogger.debug("OptViaAlgo.opt_via_location: probably endless loop");
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("OptViaAlgo.opt_via_location: probably endless loop");
+      }
       return false;
     }
     Collection<Item> contacts = p_via.get_normal_contacts();
@@ -143,7 +145,9 @@ public class OptViaAlgo {
   private static boolean opt_plane_or_fanout_via(RoutingBoard p_board, Via p_via, int p_trace_pull_tight_accuracy,
       int p_max_recursion_depth) {
     if (p_max_recursion_depth <= 0) {
-      FRLogger.debug("OptViaAlgo.opt_plane_or_fanout_via: probably endless loop");
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("OptViaAlgo.opt_plane_or_fanout_via: probably endless loop");
+      }
       return false;
     }
     Collection<Item> contact_list = p_via.get_normal_contacts();
@@ -329,7 +333,9 @@ public class OptViaAlgo {
     Point from_location = p_via.get_center();
 
     if (from_location.equals(p_to_location)) {
-      FRLogger.trace("OptViaAlgo.reposition_via: from_location equal p_to_location");
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("OptViaAlgo.reposition_via: from_location equal p_to_location");
+      }
       return false;
     }
 

@@ -225,7 +225,9 @@ public class MazeShoveTraceAlgo {
         // check, that curr_door is on the same border_line as p_from_door.
         FloatLine curr_door_segment = curr_door_shape.diagonal_corner_segment();
         if (curr_door_segment == null) {
-          FRLogger.trace("MazeShoveTraceAlgo.check_shove_trace_line: door shape is empty");
+          if (FRLogger.isTraceEnabled()) {
+            FRLogger.trace("MazeShoveTraceAlgo.check_shove_trace_line: door shape is empty");
+          }
           continue;
         }
         Side start_corner_side_of_trace_line = shove_line.side_of(curr_door_segment.a, 0);

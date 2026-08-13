@@ -159,14 +159,6 @@ public class AutorouteEngine {
     }
 
     if (search_result != null) {
-      if (p_ctrl.net_no == 33 || p_ctrl.net_no == 66 || p_ctrl.net_no == 67) {
-        String destinationType = search_result.destination_door != null
-            ? search_result.destination_door.getClass().getSimpleName()
-            : "null";
-        FRLogger.trace("compare_trace_maze_result_raw net=" + p_ctrl.net_no
-            + ", section=" + search_result.section_no_of_door
-            + ", destination_type=" + destinationType);
-      }
     }
 
     LocateFoundConnectionAlgo autoroute_result = null;
@@ -205,7 +197,9 @@ public class AutorouteEngine {
     }
 
     if (autoroute_result.connection_items == null) {
-      FRLogger.debug("AutorouteEngine.autoroute_connection: result_items != null expected");
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("AutorouteEngine.autoroute_connection: result_items != null expected");
+      }
       return new AutorouteAttemptResult(AutorouteAttemptState.SKIPPED,
           "No new connections were made between " + sourceItems + " and " + targetItems + ".");
     }
@@ -413,24 +407,28 @@ public class AutorouteEngine {
           break;
         }
       }
-      FRLogger.trace("COMPLETE_ROOM input"
-          + ", net=" + this.net_no
-          + ", layer=" + p_room.get_layer()
-          + ", room_bounds=" + describe_shape_bounds(p_room.get_shape())
-          + ", contained_bounds=" + describe_shape_bounds(p_room.get_contained_shape())
-          + ", from_door_bounds=" + describe_shape_bounds(from_door_shape)
-          + ", ignore_object=" + (ignore_object == null ? "null" : ignore_object.getClass().getSimpleName()));
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("COMPLETE_ROOM input"
+            + ", net=" + this.net_no
+            + ", layer=" + p_room.get_layer()
+            + ", room_bounds=" + describe_shape_bounds(p_room.get_shape())
+            + ", contained_bounds=" + describe_shape_bounds(p_room.get_contained_shape())
+            + ", from_door_bounds=" + describe_shape_bounds(from_door_shape)
+            + ", ignore_object=" + (ignore_object == null ? "null" : ignore_object.getClass().getSimpleName()));
+      }
       Collection<IncompleteFreeSpaceExpansionRoom> completed_shapes = this.autoroute_search_tree.complete_shape(p_room,
           this.net_no, ignore_object, from_door_shape);
       int initialCandidateIndex = 0;
       for (IncompleteFreeSpaceExpansionRoom initialCandidate : completed_shapes) {
-        FRLogger.trace("COMPLETE_ROOM initial_candidate"
-            + ", net=" + this.net_no
-            + ", layer=" + initialCandidate.get_layer()
-            + ", index=" + initialCandidateIndex
-            + ", dimension=" + initialCandidate.get_shape().dimension()
-            + ", incomplete_bounds=" + describe_shape_bounds(initialCandidate.get_shape())
-            + ", from_door_bounds=" + describe_shape_bounds(from_door_shape));
+        if (FRLogger.isTraceEnabled()) {
+          FRLogger.trace("COMPLETE_ROOM initial_candidate"
+              + ", net=" + this.net_no
+              + ", layer=" + initialCandidate.get_layer()
+              + ", index=" + initialCandidateIndex
+              + ", dimension=" + initialCandidate.get_shape().dimension()
+              + ", incomplete_bounds=" + describe_shape_bounds(initialCandidate.get_shape())
+              + ", from_door_bounds=" + describe_shape_bounds(from_door_shape));
+        }
         ++initialCandidateIndex;
       }
       this.remove_incomplete_expansion_room(p_room);
@@ -443,11 +441,13 @@ public class AutorouteEngine {
         }
         if (is_first_completed_room) {
           is_first_completed_room = false;
-          FRLogger.trace("COMPLETE_ROOM first_candidate"
-              + ", net=" + this.net_no
-              + ", layer=" + curr_incomplete_room.get_layer()
-              + ", incomplete_bounds=" + describe_shape_bounds(curr_incomplete_room.get_shape())
-              + ", from_door_bounds=" + describe_shape_bounds(from_door_shape));
+          if (FRLogger.isTraceEnabled()) {
+            FRLogger.trace("COMPLETE_ROOM first_candidate"
+                + ", net=" + this.net_no
+                + ", layer=" + curr_incomplete_room.get_layer()
+                + ", incomplete_bounds=" + describe_shape_bounds(curr_incomplete_room.get_shape())
+                + ", from_door_bounds=" + describe_shape_bounds(from_door_shape));
+          }
           CompleteFreeSpaceExpansionRoom completed_room = this.add_complete_room(curr_incomplete_room);
           if (completed_room != null) {
             result.add(completed_room);
@@ -459,11 +459,13 @@ public class AutorouteEngine {
           Collection<IncompleteFreeSpaceExpansionRoom> curr_completed_shapes = this.autoroute_search_tree
               .complete_shape(curr_incomplete_room, this.net_no, ignore_object, from_door_shape);
           for (IncompleteFreeSpaceExpansionRoom tmp_room : curr_completed_shapes) {
-            FRLogger.trace("COMPLETE_ROOM recalc_candidate"
-                + ", net=" + this.net_no
-                + ", layer=" + tmp_room.get_layer()
-                + ", incomplete_bounds=" + describe_shape_bounds(tmp_room.get_shape())
-                + ", from_door_bounds=" + describe_shape_bounds(from_door_shape));
+            if (FRLogger.isTraceEnabled()) {
+              FRLogger.trace("COMPLETE_ROOM recalc_candidate"
+                  + ", net=" + this.net_no
+                  + ", layer=" + tmp_room.get_layer()
+                  + ", incomplete_bounds=" + describe_shape_bounds(tmp_room.get_shape())
+                  + ", from_door_bounds=" + describe_shape_bounds(from_door_shape));
+            }
             CompleteFreeSpaceExpansionRoom completed_room = this.add_complete_room(tmp_room);
             if (completed_room != null) {
               result.add(completed_room);
@@ -493,10 +495,12 @@ public class AutorouteEngine {
     }
     complete_expansion_rooms.add(completed_room);
     this.autoroute_search_tree.insert(completed_room);
-    FRLogger.trace("COMPLETE_ROOM added"
-        + ", net=" + this.net_no
-        + ", layer=" + completed_room.get_layer()
-        + ", bounds=" + describe_shape_bounds(completed_room.get_shape()));
+    if (FRLogger.isTraceEnabled()) {
+      FRLogger.trace("COMPLETE_ROOM added"
+          + ", net=" + this.net_no
+          + ", layer=" + completed_room.get_layer()
+          + ", bounds=" + describe_shape_bounds(completed_room.get_shape()));
+    }
     return completed_room;
   }
 

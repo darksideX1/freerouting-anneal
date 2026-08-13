@@ -24,6 +24,7 @@ public class FloatPoint implements Serializable {
    * creates an instance of class FloatPoint from two doubles,
    */
   public FloatPoint(double p_x, double p_y) {
+    app.freerouting.datastructures.AllocationCensus.record("FloatPoint");
     x = p_x;
     y = p_y;
   }

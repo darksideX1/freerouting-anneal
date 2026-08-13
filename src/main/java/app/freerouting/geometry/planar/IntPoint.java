@@ -21,12 +21,80 @@ public class IntPoint extends Point implements Serializable {
   /**
    * create an IntPoint from two integer coordinates
    */
+  /**
+   * Coordinates seen outside the exact range, for the run as a whole.
+   *
+   * <p>Counted rather than thrown because whether a violation should end a run depends on
+   * whether it happens on real boards, and that is evidence we do not have yet. What is
+   * not defensible is the previous answer: silence.
+   */
+  private static final java.util.concurrent.atomic.AtomicLong EXACT_RANGE_VIOLATIONS =
+      new java.util.concurrent.atomic.AtomicLong();
+
+  /**
+   * Whether a coordinate keeps this geometry's arithmetic exact.
+   *
+   * <p>{@link Limits#CRIT_INT} is 2^25. Within it, the products inside
+   * {@code IntVector.side_of} are at most 2^50 and their difference at most 2^51 — inside
+   * a double's 53-bit significand, so the orientation predicates are exact with no filter
+   * and no fallback. Outside it, that guarantee is simply gone.
+   */
+  public static boolean isWithinExactRange(int coordinate) {
+    // Widen BEFORE taking the absolute value. Math.abs(Integer.MIN_VALUE) returns
+    // Integer.MIN_VALUE -- still negative -- so the int form reports the most
+    // out-of-range coordinate representable as being comfortably IN range. The original
+    // guard had this hole too, which is why MIN_VALUE never even reached the debug log.
+    return Math.abs((long) coordinate) <= Limits.CRIT_INT;
+  }
+
+  /** How many points broke the exactness invariant in this run. */
+  /**
+   * Violations since process start.
+   *
+   * <p>PROCESS-GLOBAL and never reset in production. The scheduler runs several jobs
+   * concurrently, so reading this directly to describe ONE job reports another job's
+   * violations against it, and marks every later job in the same process forever. Callers
+   * describing a single job must take a snapshot before it starts and subtract -- see
+   * {@link #exactRangeViolationsSince(long)}.
+   */
+  public static long exactRangeViolationCount() {
+    return EXACT_RANGE_VIOLATIONS.get();
+  }
+
+  /**
+   * Violations recorded since a snapshot taken with {@link #exactRangeViolationCount()}.
+   *
+   * <p>Never negative: the counter only rises, but a defensive clamp costs nothing and
+   * keeps a reordered snapshot from reporting a nonsensical negative count.
+   */
+  public static long exactRangeViolationsSince(long snapshot) {
+    long now = EXACT_RANGE_VIOLATIONS.get();
+    return Math.max(0L, now - snapshot);
+  }
+
+  /** Test hook. Not for production use. */
+  static void resetExactRangeViolations() {
+    EXACT_RANGE_VIOLATIONS.set(0);
+  }
+
   public IntPoint(int p_x, int p_y) {
-    if (Math.abs(p_x) > Limits.CRIT_INT) {
-      FRLogger.debug("IntPoint: p_x is out of range");
-    }
-    if (Math.abs(p_y) > Limits.CRIT_INT) {
-      FRLogger.debug("IntPoint: p_y is out of range");
+    app.freerouting.datastructures.AllocationCensus.record("IntPoint");
+    if (!isWithinExactRange(p_x) || !isWithinExactRange(p_y)) {
+      // Counted per POINT, not per axis: the question a reader asks is how many points
+      // broke the invariant, and counting both coordinates of one bad point overstates it.
+      long violations = EXACT_RANGE_VIOLATIONS.incrementAndGet();
+      if (violations == 1) {
+        // Once, loudly. A board that breaks this breaks it in a loop, so the first
+        // occurrence carries the detail and the total is reported at the end of the run.
+        // This used to be a debug() behind isDebugEnabled(), i.e. nothing at all at the
+        // default level, while the geometry kept computing on arithmetic that was no
+        // longer guaranteed exact.
+        FRLogger.error("Coordinate outside the exact range: (" + p_x + ", " + p_y + ");"
+            + " the limit is +/-" + Limits.CRIT_INT + " (2^25). Beyond it this geometry's"
+            + " orientation predicates are no longer guaranteed exact, so any clearance"
+            + " result from this board must be treated as unverified. Further occurrences"
+            + " are counted, not logged.", null);
+      }
     }
 
     x = p_x;
@@ -100,6 +168,20 @@ public class IntPoint extends Point implements Serializable {
    */
   @Override
   public Vector difference_by(Point p_other) {
+    // US-3. The double-dispatch route allocates TWICE on the dominant path: p_other
+    // .difference_by(this) builds an IntVector, and negate() builds a second one while the
+    // first becomes garbage immediately. It was 4.2% of all allocation on bm01.
+    //
+    // IntVector.negate() is new IntVector(-x, -y), so -(other.x - x) is simply x - other.x:
+    // the same value, one allocation. Overflow is not reachable here because the exactness
+    // invariant caps coordinates at +/-2^25, so a difference cannot exceed 2^26 and cannot
+    // touch the Integer.MIN_VALUE negation edge case.
+    //
+    // The general path is untouched: only the IntPoint-to-IntPoint case short-circuits,
+    // everything else still dispatches as before.
+    if (p_other instanceof IntPoint other) {
+      return new IntVector(x - other.x, y - other.y);
+    }
     Vector tmp = p_other.difference_by(this);
     return tmp.negate();
   }

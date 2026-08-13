@@ -164,7 +164,9 @@ public abstract class PullTightAlgo {
         FRLogger.error("PullTightAlgo.is_stop_requested: board is null", null);
       }
 
-      FRLogger.debug("PullTightAlgo.is_stop_requested: time limit exceeded");
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("PullTightAlgo.is_stop_requested: time limit exceeded");
+      }
     }
     return time_limit_exceeded;
   }

@@ -162,6 +162,16 @@ public abstract class ShapeTree {
      * Stores the entries in the ShapeTrees of this object for better performance while for example deleting tree entries. Called only by insert methods of class ShapeTree.
      */
     void set_search_tree_entries(Leaf[] p_entries, ShapeTree p_tree);
+
+    /**
+     * Returns the shape with index p_index enlarged by p_half_clearance. The default computes
+     * it every time, which is correct for anything with nowhere to keep it; implementations
+     * that already hold derived shape data should override and keep it.
+     */
+    default TileShape get_enlarged_tree_shape(ShapeTree p_tree, int p_index, int p_half_clearance) {
+      TileShape base_shape = get_tree_shape(p_tree, p_index);
+      return base_shape == null ? null : (TileShape) base_shape.enlarge(p_half_clearance);
+    }
   }
 
   /**

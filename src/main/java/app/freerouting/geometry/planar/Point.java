@@ -9,6 +9,14 @@ import java.math.BigInteger;
 public abstract class Point implements Serializable {
 
   /**
+   * Shared zero-length array. A Point[0] carries no state, so one instance serves every
+   * caller -- allocating a fresh one per call is pure garbage, and these are commonly
+   * passed as the "impacted points" argument of diagnostics in the routing hot path.
+   */
+  public static final Point[] EMPTY = new Point[0];
+
+
+  /**
    * Standard implementation of the zero point .
    */
   public static final IntPoint ZERO = new IntPoint(0, 0);

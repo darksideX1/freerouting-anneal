@@ -671,10 +671,11 @@ public class JobControllerV1 extends BaseController {
           .build();
     }
 
-    // Reject jobs that have failed, been cancelled, or are in an invalid terminal state
-    if (job.state == RoutingJobState.TERMINATED
-        || job.state == RoutingJobState.CANCELLED
-        || job.state == RoutingJobState.TIMED_OUT
+    // Reject terminal states that left nothing worth serving. TIMED_OUT is NOT one of
+    // them: a time-boxed run is a request for the best board at the deadline, and the CLI
+    // writes exactly that board to disk. The same job must not yield a board through one
+    // interface and "has no valid output" through the other.
+    if ((job.state.isTerminal() && !job.state.hasUsableOutput())
         || job.state == RoutingJobState.INVALID) {
       return Response
           .status(Response.Status.BAD_REQUEST)
@@ -770,10 +771,8 @@ public class JobControllerV1 extends BaseController {
           .build();
     }
 
-    // Reject terminal error states
-    if (job.state == RoutingJobState.TERMINATED
-        || job.state == RoutingJobState.CANCELLED
-        || job.state == RoutingJobState.TIMED_OUT
+    // Reject terminal states with nothing worth serving -- see the SES endpoint above.
+    if ((job.state.isTerminal() && !job.state.hasUsableOutput())
         || job.state == RoutingJobState.INVALID) {
       return Response.status(Response.Status.BAD_REQUEST)
           .entity(GSON.toJson(java.util.Map.of("error", "The job is in state '" + job.state + "' and has no valid output.")))
@@ -907,8 +906,10 @@ public class JobControllerV1 extends BaseController {
           }
         }
 
-        // Close the connection if the job is completed or cancelled
-        if (job.state == RoutingJobState.COMPLETED || job.state == RoutingJobState.CANCELLED) {
+        // Close on ANY terminal state. Listing two of the four meant a timed-out or
+        // errored job left the stream open, re-sending every 500 ms for as long as the
+        // client stayed connected.
+        if (job.state.isTerminal()) {
           try {
             eventSink.close();
           } catch (Exception ex) {
@@ -990,8 +991,10 @@ public class JobControllerV1 extends BaseController {
           }
         }
 
-        // Close the connection if the job is completed or cancelled
-        if (job.state == RoutingJobState.COMPLETED || job.state == RoutingJobState.CANCELLED) {
+        // Close on ANY terminal state. Listing two of the four meant a timed-out or
+        // errored job left the stream open, re-sending every 500 ms for as long as the
+        // client stayed connected.
+        if (job.state.isTerminal()) {
           try {
             eventSink.close();
           } catch (Exception ex) {
@@ -1103,6 +1106,32 @@ public class JobControllerV1 extends BaseController {
     // Create a scheduled executor for periodic updates
     ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
 
+    // A client that subscribes AFTER the job has finished would otherwise wait forever:
+    // the only thing that evaluates isTerminal() below is the arrival of a new log entry,
+    // and a finished job produces none. Close immediately instead.
+    if (job.state.isTerminal()) {
+      try {
+        eventSink.close();
+      } catch (Exception ex) {
+        FRLogger.error("Error closing SSE event sink", ex);
+      }
+      executor.shutdown();
+      return;
+    }
+
+    // And close it if the job reaches a terminal state without logging anything further --
+    // the listener cannot notice a transition that produces no entry.
+    executor.scheduleAtFixedRate(() -> {
+      if (job.state.isTerminal()) {
+        try {
+          eventSink.close();
+        } catch (Exception ex) {
+          FRLogger.error("Error closing SSE event sink", ex);
+        }
+        executor.shutdown();
+      }
+    }, 1, 1, java.util.concurrent.TimeUnit.SECONDS);
+
     // stream a new log entry when the job logsEntryAdded event was fired
     job.addLogEntryAddedEventListener(e -> {
       try {
@@ -1115,8 +1144,10 @@ public class JobControllerV1 extends BaseController {
 
         eventSink.send(event);
 
-        // Close the connection if the job is completed or cancelled
-        if (job.state == RoutingJobState.COMPLETED || job.state == RoutingJobState.CANCELLED) {
+        // Close on ANY terminal state. Listing two of the four meant a timed-out or
+        // errored job left the stream open, re-sending every 500 ms for as long as the
+        // client stayed connected.
+        if (job.state.isTerminal()) {
           try {
             eventSink.close();
           } catch (Exception closeEx) {

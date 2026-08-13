@@ -202,13 +202,17 @@ public class PolylineTrace extends Trace implements Serializable {
       contacts.removeIf(c -> c instanceof ConductionArea);
     }
     if (debugNet49) {
-      FRLogger.trace("compare_trace_combine_at_start_net49 thisId=" + this.get_id_no()
-          + ", thisFixed=" + this.get_fixed_state()
-          + ", start=" + start_corner + ", contacts=" + contacts.size());
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("compare_trace_combine_at_start_net49 thisId=" + this.get_id_no()
+            + ", thisFixed=" + this.get_fixed_state()
+            + ", start=" + start_corner + ", contacts=" + contacts.size());
+      }
       for (Item c : contacts) {
-        FRLogger.trace("  contact id=" + c.get_id_no() + ", type=" + c.getClass().getSimpleName()
-            + ", fixed=" + c.get_fixed_state()
-            + (c instanceof Trace t ? ", first=" + t.first_corner() + ", last=" + t.last_corner() : ""));
+        if (FRLogger.isTraceEnabled()) {
+          FRLogger.trace("  contact id=" + c.get_id_no() + ", type=" + c.getClass().getSimpleName()
+              + ", fixed=" + c.get_fixed_state()
+              + (c instanceof Trace t ? ", first=" + t.first_corner() + ", last=" + t.last_corner() : ""));
+        }
       }
     }
     if (contacts.size() != 1) {
@@ -233,10 +237,12 @@ public class PolylineTrace extends Trace implements Serializable {
             break;
           }
         } else if (debugNet49) {
-          FRLogger.trace("  combine_at_start REJECTED: layer=" + other_trace.get_layer() + "==" + get_layer()
-              + ", nets=" + other_trace.nets_equal(this)
-              + ", width=" + other_trace.get_half_width() + "==" + get_half_width()
-              + ", fixed=" + other_trace.get_fixed_state() + "==" + this.get_fixed_state());
+          if (FRLogger.isTraceEnabled()) {
+            FRLogger.trace("  combine_at_start REJECTED: layer=" + other_trace.get_layer() + "==" + get_layer()
+                + ", nets=" + other_trace.nets_equal(this)
+                + ", width=" + other_trace.get_half_width() + "==" + get_half_width()
+                + ", fixed=" + other_trace.get_fixed_state() + "==" + this.get_fixed_state());
+          }
         }
       }
     }
@@ -319,13 +325,17 @@ public class PolylineTrace extends Trace implements Serializable {
       contacts.removeIf(c -> c instanceof ConductionArea);
     }
     if (debugNet49) {
-      FRLogger.trace("compare_trace_combine_at_end_net49 thisId=" + this.get_id_no()
-          + ", thisFixed=" + this.get_fixed_state()
-          + ", end=" + end_corner + ", contacts=" + contacts.size());
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("compare_trace_combine_at_end_net49 thisId=" + this.get_id_no()
+            + ", thisFixed=" + this.get_fixed_state()
+            + ", end=" + end_corner + ", contacts=" + contacts.size());
+      }
       for (Item c : contacts) {
-        FRLogger.trace("  contact id=" + c.get_id_no() + ", type=" + c.getClass().getSimpleName()
-            + ", fixed=" + c.get_fixed_state()
-            + (c instanceof Trace t ? ", first=" + t.first_corner() + ", last=" + t.last_corner() : ""));
+        if (FRLogger.isTraceEnabled()) {
+          FRLogger.trace("  contact id=" + c.get_id_no() + ", type=" + c.getClass().getSimpleName()
+              + ", fixed=" + c.get_fixed_state()
+              + (c instanceof Trace t ? ", first=" + t.first_corner() + ", last=" + t.last_corner() : ""));
+        }
       }
     }
     if (contacts.size() != 1) {
@@ -486,13 +496,15 @@ public class PolylineTrace extends Trace implements Serializable {
 
           boolean debugNet49 = this.net_no_arr != null && this.net_no_arr.length > 0 && this.net_no_arr[0] == 49;
           if (debugNet49 && intersecting_lines.length > 0) {
-            FRLogger.trace("compare_trace_split_found_trace net=49, this_id=" + this.get_id_no()
-                + ", this_seg=" + i
-                + ", this_first=" + this.first_corner() + ", this_last=" + this.last_corner()
-                + ", found_id=" + found_trace.get_id_no()
-                + ", found_seg=" + found_entry.shape_index_in_object
-                + ", found_first=" + found_trace.first_corner() + ", found_last=" + found_trace.last_corner()
-                + ", intersections=" + intersecting_lines.length);
+            if (FRLogger.isTraceEnabled()) {
+              FRLogger.trace("compare_trace_split_found_trace net=49, this_id=" + this.get_id_no()
+                  + ", this_seg=" + i
+                  + ", this_first=" + this.first_corner() + ", this_last=" + this.last_corner()
+                  + ", found_id=" + found_trace.get_id_no()
+                  + ", found_seg=" + found_entry.shape_index_in_object
+                  + ", found_first=" + found_trace.first_corner() + ", found_last=" + found_trace.last_corner()
+                  + ", intersections=" + intersecting_lines.length);
+            }
           }
 
           // try splitting the found trace first
@@ -508,15 +520,22 @@ public class PolylineTrace extends Trace implements Serializable {
                   if (curr_split_pieces[k] != null) {
                     found_trace_split = true;
                     if (this.net_no_arr.length > 0 && this.net_no_arr[0] == 94) {
+                      // i and j are loop counters, so the lambdas cannot capture them.
+                      // Two ints to keep the deferral is cheaper than giving it up.
+                      final int lineIndex = i;
+                      final int intersectionIndex = j;
+                      final var entry = found_entry;
+                      final var foundTrace = found_trace;
+                      final var intersectingLines = intersecting_lines;
                       FRLogger.trace(
                           "PolylineTrace.split",
                           "compare_trace_found_trace_split",
-                          "found_trace_split=true at line index " + found_entry.shape_index_in_object
-                              + " with intersection " + intersecting_lines[j],
-                          "Net #" + this.net_no_arr[0] + ",Trace #" + found_trace.get_id_no() + ",Layer #"
-                              + found_trace.get_layer(),
-                          new Point[] { found_trace.first_corner(), found_trace.last_corner(), lines.corner(i),
-                              lines.corner(i + 1) });
+                          () -> "found_trace_split=true at line index " + entry.shape_index_in_object
+                              + " with intersection " + intersectingLines[intersectionIndex],
+                          () -> "Net #" + this.net_no_arr[0] + ",Trace #" + foundTrace.get_id_no() + ",Layer #"
+                              + foundTrace.get_layer(),
+                          () -> new Point[] { foundTrace.first_corner(), foundTrace.last_corner(),
+                              lines.corner(lineIndex), lines.corner(lineIndex + 1) });
                     }
                     split_pieces.add(curr_split_pieces[k]);
                   }
@@ -564,11 +583,13 @@ public class PolylineTrace extends Trace implements Serializable {
                 int pieceId = curr_piece.get_id_no();
                 boolean removedAsCycle = board.remove_if_cycle(curr_piece);
                 if (debugThis && removedAsCycle) {
-                  FRLogger.trace("compare_trace_split_cycle_removed net=49, pass=" + j
-                      + ", piece_id=" + pieceId
-                      + ", piece_first=" + pieceFirst
-                      + ", piece_last=" + pieceLast
-                      + ", this_id=" + this.get_id_no());
+                  if (FRLogger.isTraceEnabled()) {
+                    FRLogger.trace("compare_trace_split_cycle_removed net=49, pass=" + j
+                        + ", piece_id=" + pieceId
+                        + ", piece_first=" + pieceFirst
+                        + ", piece_last=" + pieceLast
+                        + ", this_id=" + this.get_id_no());
+                  }
                 }
               }
 
@@ -750,9 +771,11 @@ public class PolylineTrace extends Trace implements Serializable {
       //   2. Intermediate trace fragments created during deep-recursion split/combine were left in an
       //      inconsistent state, causing them to be misidentified as tails and removed by remove_tails(),
       //      which in turn forced GND routing to re-attempt the same connection on every subsequent pass.
-      FRLogger.debug("PolylineTrace.normalize: max normalization depth (" + MAX_NORMALIZATION_DEPTH
-          + ") reached for trace #" + this.get_id_no() + " on net "
-          + (this.net_count() > 0 ? this.net_no_arr[0] : -1) + " — stopping recursion, trace kept as-is.");
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("PolylineTrace.normalize: max normalization depth (" + MAX_NORMALIZATION_DEPTH
+            + ") reached for trace #" + this.get_id_no() + " on net "
+            + (this.net_count() > 0 ? this.net_no_arr[0] : -1) + " — stopping recursion, trace kept as-is.");
+      }
       return false;
     }
 
@@ -770,25 +793,31 @@ public class PolylineTrace extends Trace implements Serializable {
     Collection<PolylineTrace> split_pieces = this.split(p_clip_shape);
     boolean result = split_pieces.size() != 1;
     if (debugNet49) {
-      FRLogger.trace("compare_trace_normalize_net49 depth=" + normalization_depth
-          + ", thisId=" + this.get_id_no() + ", thisOnBoard=" + this.is_on_the_board()
-          + ", thisFirst=" + this.first_corner() + ", thisLast=" + this.last_corner()
-          + ", splitPieces=" + split_pieces.size());
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("compare_trace_normalize_net49 depth=" + normalization_depth
+            + ", thisId=" + this.get_id_no() + ", thisOnBoard=" + this.is_on_the_board()
+            + ", thisFirst=" + this.first_corner() + ", thisLast=" + this.last_corner()
+            + ", splitPieces=" + split_pieces.size());
+      }
       for (PolylineTrace piece : split_pieces) {
-        FRLogger.trace("compare_trace_normalize_net49  piece id=" + piece.get_id_no()
-            + ", onBoard=" + piece.is_on_the_board()
-            + ", first=" + piece.first_corner() + ", last=" + piece.last_corner());
+        if (FRLogger.isTraceEnabled()) {
+          FRLogger.trace("compare_trace_normalize_net49  piece id=" + piece.get_id_no()
+              + ", onBoard=" + piece.is_on_the_board()
+              + ", first=" + piece.first_corner() + ", last=" + piece.last_corner());
+        }
       }
     }
     for (PolylineTrace curr_split_trace : split_pieces) {
       if (curr_split_trace.is_on_the_board()) {
         boolean trace_combined = curr_split_trace.combine();
         if (debugNet49) {
-          FRLogger.trace("compare_trace_normalize_net49  after_combine id=" + curr_split_trace.get_id_no()
-              + ", onBoard=" + curr_split_trace.is_on_the_board()
-              + ", combined=" + trace_combined
-              + ", first=" + (curr_split_trace.is_on_the_board() ? curr_split_trace.first_corner() : "N/A")
-              + ", last=" + (curr_split_trace.is_on_the_board() ? curr_split_trace.last_corner() : "N/A"));
+          if (FRLogger.isTraceEnabled()) {
+            FRLogger.trace("compare_trace_normalize_net49  after_combine id=" + curr_split_trace.get_id_no()
+                + ", onBoard=" + curr_split_trace.is_on_the_board()
+                + ", combined=" + trace_combined
+                + ", first=" + (curr_split_trace.is_on_the_board() ? curr_split_trace.first_corner() : "N/A")
+                + ", last=" + (curr_split_trace.is_on_the_board() ? curr_split_trace.last_corner() : "N/A"));
+          }
         }
         if (curr_split_trace.corner_count() == 2 && curr_split_trace
             .first_corner()
@@ -804,8 +833,10 @@ public class PolylineTrace extends Trace implements Serializable {
             // A degenerate user-fixed trace (first==last corner) cannot be removed because
             // deletion is forbidden. This is expected for boards with malformed DSN geometry
             // (e.g. bad EDA export). The user was already warned at load time; suppress here.
-            FRLogger.debug("PolylineTrace.normalize: skipping removal of degenerate user-fixed trace #"
-                + curr_split_trace.get_id_no() + " on net " + netNo + " (first==last corner)");
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug("PolylineTrace.normalize: skipping removal of degenerate user-fixed trace #"
+                  + curr_split_trace.get_id_no() + " on net " + netNo + " (first==last corner)");
+            }
           }
         } else if (trace_combined) {
           curr_split_trace.normalize(p_clip_shape, normalization_depth + 1);

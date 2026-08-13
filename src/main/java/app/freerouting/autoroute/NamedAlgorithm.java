@@ -32,6 +32,53 @@ public abstract class NamedAlgorithm implements Serializable {
   // board reference after deserialisation if needed.
   protected transient RoutingBoard board;
 
+  /**
+   * CPU seconds burned by the calling thread, or -1 when the JVM will not say.
+   *
+   * <p>Lived identically in {@code BatchAutorouter} and {@code BatchOptimizer}. Both extend
+   * this class, so it belongs here.
+   */
+  protected static float sampleCurrentThreadCpuSeconds() {
+    try {
+      com.sun.management.ThreadMXBean threadMxBean =
+          (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+      long cpuNanos = threadMxBean.getThreadCpuTime(Thread.currentThread().threadId());
+      return cpuNanos < 0 ? -1f : cpuNanos / 1_000_000_000.0f;
+    } catch (Throwable t) {
+      return -1f;
+    }
+  }
+
+  /** Megabytes allocated by the calling thread, or -1 when the JVM will not say. */
+  protected static float sampleCurrentThreadAllocatedMb() {
+    try {
+      com.sun.management.ThreadMXBean threadMxBean =
+          (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+      threadMxBean.setThreadAllocatedMemoryEnabled(true);
+      long allocatedBytes = threadMxBean.getThreadAllocatedBytes(Thread.currentThread().threadId());
+      return allocatedBytes < 0 ? -1f : allocatedBytes / (1024.0f * 1024.0f);
+    } catch (Throwable t) {
+      return -1f;
+    }
+  }
+
+  /** Heap megabytes in use, or 0 when the JVM will not say. */
+  protected static float sampleHeapUsageMb() {
+    try {
+      long heapUsed = java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
+      return heapUsed / (1024.0f * 1024.0f);
+    } catch (Throwable t) {
+      return 0f;
+    }
+  }
+
+  /** Incomplete connections on a board, via a throwaway DRC pass. */
+  protected int calculateIncompleteCount(RoutingBoard board) {
+    app.freerouting.drc.DesignRulesChecker tempDrc = new app.freerouting.drc.DesignRulesChecker(board, null);
+    tempDrc.calculateAllIncompletes();
+    return tempDrc.getIncompleteCount();
+  }
+
   protected NamedAlgorithm(StoppableThread thread, RoutingBoard board, RouterSettings settings) {
     this.thread = thread;
     this.board = board;

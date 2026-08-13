@@ -35,6 +35,59 @@ public class BatchOptimizer extends NamedAlgorithm {
   protected RoutingJob job;
   protected int totalItemsOptimized = 0;
   protected Long deadlineMs = null;
+
+  /**
+   * How far before the job's own deadline the optimiser stage must stop.
+   *
+   * <p>Sized against the WATCHDOG, not against the work. Finalisation after the stage --
+   * final statistics and writing the session file -- was measured at 16 to 73 ms across
+   * three boards, so it is not what this must cover.
+   *
+   * <p>What it must cover is the monitor thread's polling interval. The watchdog wakes every
+   * 1000 ms, and marks the job TIMED_OUT only if the deadline has passed AND something has
+   * requested a stop -- the stop request being the watchdog's own. So a grace EQUAL to the
+   * tick is a coin flip: the job either finishes first, or the watchdog ticks first and
+   * brands a cleanly-finished run as timed out. That is exactly what was observed -- the
+   * same board reported COMPLETED at a 120 s budget and TIMED_OUT at 68 s, with the stage
+   * ending gracefully both times.
+   *
+   * <p>Five seconds is five ticks of headroom, still negligible against any real budget.
+   */
+  static final long OPTIMIZER_DEADLINE_GRACE_MS = 5_000L;
+
+  /**
+   * The deadline for the optimiser stage.
+   *
+   * <p>The stage timeout used to default to unset, i.e. unbounded, so what actually ended
+   * the optimiser was the JOB timeout firing around it. That is the ugly ending: the stage
+   * is cut off mid-pass and the run is reported {@code TIMED_OUT}, instead of the stage
+   * stopping cleanly and presenting the best board it found. Someone who allows two minutes
+   * should get the best board achievable in two minutes, not a failure.
+   *
+   * <p>So it is derived instead of left implicit, and derived AT STAGE START, which makes it
+   * self-adjusting: whatever routing already consumed is simply not in the remaining window.
+   * Allow the job three minutes and the optimiser gets three minutes, minus routing, minus
+   * the grace.
+   *
+   * <p>An explicit stage timeout may only ever SHORTEN this. A stage timeout longer than the
+   * job it runs inside is not a longer stage -- it is the cut-off again, arriving by another
+   * route.
+   *
+   * <p>DETERMINISM, because this touches defect 20: a deadline stop is wall-clock dependent
+   * and therefore machine dependent. This makes stopping GRACEFUL, not REPRODUCIBLE. If
+   * reproducibility is wanted the primary bound must be work units with the clock as a
+   * backstop, which is a separate change and deliberately not smuggled in here.
+   *
+   * @param explicitTimeoutSeconds the configured stage timeout, or null if unset
+   * @param jobDeadlineMs          the job's own deadline, or null if the job is unbounded
+   * @param nowMs                  the current time, passed in so this stays pure and testable
+   * @return the stage deadline, or null when nothing bounds the stage at all
+   */
+  static Long computeOptimizerDeadlineMs(Long explicitTimeoutSeconds, Long jobDeadlineMs, long nowMs) {
+    // Delegates: every stage stops by the same rule, and one copy cannot drift from another.
+    return StageDeadline.compute(explicitTimeoutSeconds, jobDeadlineMs, nowMs);
+  }
+
   protected boolean isTimedOut = false;
 
   /**
@@ -60,41 +113,11 @@ public class BatchOptimizer extends NamedAlgorithm {
     return true;
   }
 
-  private static float sampleCurrentThreadCpuSeconds() {
-    try {
-      ThreadMXBean threadMxBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
-      long cpuNanos = threadMxBean.getThreadCpuTime(Thread.currentThread().threadId());
-      return cpuNanos < 0 ? -1f : cpuNanos / 1_000_000_000.0f;
-    } catch (Throwable t) {
-      return -1f;
-    }
-  }
-
-  private static float sampleCurrentThreadAllocatedMb() {
-    try {
-      ThreadMXBean threadMxBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
-      threadMxBean.setThreadAllocatedMemoryEnabled(true);
-      long allocatedBytes = threadMxBean.getThreadAllocatedBytes(Thread.currentThread().threadId());
-      return allocatedBytes < 0 ? -1f : allocatedBytes / (1024.0f * 1024.0f);
-    } catch (Throwable t) {
-      return -1f;
-    }
-  }
-
-  private static float sampleHeapUsageMb() {
-    try {
-      long heapUsed = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
-      return heapUsed / (1024.0f * 1024.0f);
-    } catch (Throwable t) {
-      return 0f;
-    }
-  }
-
   /**
    * Optimize the route on the board.
    */
   public void runBatchLoop() {
-    job.logDebug("Before optimization: Via count: " + board
+    job.logDebug(() -> "Before optimization: Via count: " + board
         .get_vias()
         .size() + ", trace length: " + Math.round(board.cumulative_trace_length()));
 
@@ -117,11 +140,23 @@ public class BatchOptimizer extends NamedAlgorithm {
     float allocMbStart = sampleCurrentThreadAllocatedMb();
     float peakHeapMb = sampleHeapUsageMb();
 
+    Long explicitOptimizerTimeoutSeconds = null;
     if (this.settings.optimizer != null && this.settings.optimizer.timeoutString != null) {
-      Long timeoutSeconds = app.freerouting.util.TextManager.parseTimespanString(this.settings.optimizer.timeoutString);
-      if (timeoutSeconds != null) {
-        this.deadlineMs = sessionStartMs + timeoutSeconds * 1000;
-      }
+      explicitOptimizerTimeoutSeconds =
+          app.freerouting.util.TextManager.parseTimespanString(this.settings.optimizer.timeoutString);
+    }
+    // The job's deadline, if it has one, is what makes the stage self-limiting: the
+    // optimiser stops just before the job clock would cut it off, so the run ends as
+    // COMPLETED with the best board found rather than TIMED_OUT mid-pass.
+    Long jobDeadlineMs = (job != null && job.timeoutAt != null) ? job.timeoutAt.toEpochMilli() : null;
+    this.deadlineMs =
+        computeOptimizerDeadlineMs(explicitOptimizerTimeoutSeconds, jobDeadlineMs, sessionStartMs);
+    if (this.deadlineMs != null) {
+      job.logInfo("Optimization stage will stop by "
+          + Math.max(0, (this.deadlineMs - sessionStartMs) / 1000) + "s from now"
+          + (jobDeadlineMs != null && explicitOptimizerTimeoutSeconds == null
+              ? " (derived from the job's remaining time)" : "")
+          + ", so it finishes before the job deadline rather than being cut off by it.");
     }
 
     this.fireTaskStateChangedEvent(new TaskStateChangedEvent(this, TaskState.STARTED, 0, this.board.get_hash()));
@@ -206,6 +241,21 @@ public class BatchOptimizer extends NamedAlgorithm {
         peakHeapMb));
   }
 
+  // Guard constants and predicates live in OptimizerPassLimiter, the single home both this
+  // class and BatchOptimizerMultiThreaded consult. They lived here first -- and the MT
+  // subclass overrides opt_route_pass wholesale, so everything defined here was bypassed on
+  // the GUI's default path.
+
+  /**
+   * The length baseline an item comparison runs against: the value a pass established, or
+   * -- for a task-fresh optimizer that never ran a pass -- the board's own current length.
+   * Zero is never a real baseline; it is the unset marker, and comparing against it made
+   * every length change read as an explosion.
+   */
+  static double lengthBaseline(double p_current, double p_from_board) {
+    return p_current == 0.0 ? p_from_board : p_current;
+  }
+
   /**
    * Tries to reduce the number of vias and the trace length of a completely
    * routed board. Returns the amount of improvements is made in percentage
@@ -229,9 +279,44 @@ public class BatchOptimizer extends NamedAlgorithm {
 
     FRLogger.traceEntry(optimizationPassId);
 
-    int consecutiveFailures = 0;
-    int maxConsecutiveFailures = this.settings.optimizer.maxConsecutiveFailures != null
-        ? this.settings.optimizer.maxConsecutiveFailures : 50;
+    // Progress guard. The pass stops when the BOARD stops getting better by its own score,
+    // which prices vias and trace length -- the two quantities this stage exists to reduce.
+    //
+    // The previous guard counted items examined since the board became more complete or more
+    // legal. Measured across 26 boards from the routed outputs, this stage moves neither of
+    // those and removes 10.3% of all vias. That guard was therefore blind to the entire useful
+    // output of the stage it was guarding, and would cut a pass off while it was working.
+    //
+    // There is deliberately no setting for this. A stage that cannot tell it has stopped
+    // improving is not something a user should have to tune, and a knob here invites the
+    // advice "raise it and you might complete a board", which is not advice worth giving.
+    // The guard keeps its OWN clock. It used to ask progressThrottler, which is shared with
+    // two per-item callers inside opt_route_item that fire the display events. shouldUpdate()
+    // stamps its timestamp when it returns true, so those two consumed every tick and the
+    // guard was starved: it ran 0 times in 93 seconds of optimisation. Attaching a decision
+    // to a throttle built for display is the defect, not the interval.
+    float scoreAtWindowStart = boardStatisticsBefore.getNormalizedScore(job.routerSettings.scoring);
+    int itemsAtWindowStart = 0;
+
+    // The alternative, when the user has asked for it: a flat cap on items examined per
+    // pass, and the automatic guard switched off. One mechanism or the other, never both,
+    // so the log always explains the run from a single line.
+    Integer roundsSetting =
+        OptimizerPassLimiter.validateRounds(this.settings.optimizer.rounds, m -> job.logError(m, null));
+    boolean useRounds = roundsSetting != null;
+    if (useRounds) {
+      job.logInfo(String.format(java.util.Locale.US,
+          "Optimization pass #%d will examine at most %d items; the automatic progress guard "
+          + "is off because router.optimizer.rounds was set.", p_pass_no, roundsSetting));
+    }
+
+    // What this pass actually looked at. Until defect 25 the pass reported only its
+    // duration, so a pass that visited nothing and a pass that visited everything and
+    // improved nothing produced the same line -- and told apart only by re-running the
+    // whole job under a debugger. A stage whose job is to improve the board should say how
+    // much of it it examined.
+    int itemsVisited = 0;
+    int itemsImproved = 0;
 
     while (true) {
       if (this.deadlineMs != null && System.currentTimeMillis() >= this.deadlineMs) {
@@ -254,26 +339,51 @@ public class BatchOptimizer extends NamedAlgorithm {
       }
       ItemRouteResult result = opt_route_item(curr_item, p_with_preferred_directions, false);
       this.totalItemsOptimized++;
+      itemsVisited++;
       if (result.improved()) {
-        consecutiveFailures = 0;
-        if (progressThrottler.shouldUpdate()) {
-          BoardStatistics boardStatisticsAfter = board.get_statistics();
-          this.fireBoardUpdatedEvent(boardStatisticsAfter, routerCounters, board);
-        }
-
-        route_improved = (float) (boardStatisticsBefore.items.viaCount != 0
+        itemsImproved++;
+        // Highest improvement seen in this pass, not the last one seen. This was assigned
+        // outright, so a trivially-improving item at the end of the list decided whether
+        // another pass ran.
+        float item_improvement = (float) (boardStatisticsBefore.items.viaCount != 0
             && boardStatisticsBefore.traces.totalLength != 0
                 ? 1.0 - ((((float) result.via_count() / boardStatisticsBefore.items.viaCount)
                     + (result.trace_length() / boardStatisticsBefore.traces.totalLength)) / 2)
                 : 0);
-      } else {
-        consecutiveFailures++;
-        if (consecutiveFailures >= maxConsecutiveFailures) {
+        route_improved = Math.max(route_improved, item_improvement);
+      }
+
+      // Runs whether or not this item improved: a long run of items that cannot be improved
+      // is exactly the state the guard exists to catch.
+      //
+      // The question is not "did anything move" but "is it moving fast enough to be worth the
+      // clock". Items report local improvements almost continuously while the board creeps by
+      // amounts too small to matter, so a binary test never fires. One statistics computation
+      // per window, which is cheap next to routing an item.
+      if (useRounds) {
+        if (itemsVisited >= roundsSetting) {
           job.logInfo(String.format(java.util.Locale.US,
-              "Stopping optimization pass #%d early after %d consecutive items could not be improved.",
-              p_pass_no, consecutiveFailures));
+              "Stopping optimization pass #%d: examined the requested %d items (%d improved).",
+              p_pass_no, itemsVisited, itemsImproved));
           break;
         }
+        continue;
+      }
+
+      if (itemsVisited - itemsAtWindowStart >= OptimizerPassLimiter.GUARD_WINDOW_WORK_UNITS) {
+        float scoreNow = board.get_statistics().getNormalizedScore(job.routerSettings.scoring);
+        if (!OptimizerPassLimiter.windowProgressed(scoreAtWindowStart, scoreNow)) {
+          job.logInfo(String.format(java.util.Locale.US,
+              "Stopping optimization pass #%d: the board score improved by less than %.2f%% over "
+              + "the last %d items examined (%d examined in total, %d improved). Continuing "
+              + "this pass will not pay for itself.",
+              p_pass_no, OptimizerPassLimiter.GUARD_MIN_RELATIVE_GAIN * 100,
+              OptimizerPassLimiter.GUARD_WINDOW_WORK_UNITS,
+              itemsVisited, itemsImproved));
+          break;
+        }
+        scoreAtWindowStart = scoreNow;
+        itemsAtWindowStart = itemsVisited;
       }
     }
 
@@ -287,8 +397,8 @@ public class BatchOptimizer extends NamedAlgorithm {
     BoardStatistics boardStatisticsAfter = new BoardStatistics(this.board);
     this.fireBoardUpdatedEvent(boardStatisticsAfter, routerCounters, this.board);
     job.logInfo(String.format(java.util.Locale.US,
-        "Optimizer pass #%d on board '%s' was completed in %.2f seconds with the score of %s.",
-        p_pass_no, this.board.get_hash(), routeoptimizer_pass_duration,
+        "Optimizer pass #%d on board '%s' examined %d item(s), improved %d, completed in %.2f seconds with the score of %s.",
+        p_pass_no, this.board.get_hash(), itemsVisited, itemsImproved, routeoptimizer_pass_duration,
         FRLogger.formatScore(
             boardStatisticsAfter.getNormalizedScore(job.routerSettings.scoring),
             boardStatisticsAfter.connections.incompleteCount, boardStatisticsAfter.clearanceViolations.totalCount)));
@@ -305,6 +415,24 @@ public class BatchOptimizer extends NamedAlgorithm {
    *                                    means that the routing cannot be undone,
    *                                    but it's much more efficient
    */
+
+  /**
+   * Whether the board is better than when this pass started.
+   *
+   * <p>Progress is the board being more complete or more legal. It is deliberately NOT
+   * "an item was re-routed to something its own measure prefers": a pass on one board
+   * reported 82 of 85 items improved and returned a board identical in every respect, and
+   * that signal was what kept the early-stop from ever firing.
+   *
+   * <p>A trade -- a connection completed while a violation appears -- counts as progress.
+   * Completion is this stage's job and the violation is reported separately; treating the
+   * trade as failure would silence the fact that work was done.
+   */
+  static boolean outcomeImproved(int p_unrouted_before, int p_violations_before,
+      int p_unrouted_after, int p_violations_after) {
+    return p_unrouted_after < p_unrouted_before || p_violations_after < p_violations_before;
+  }
+
   protected ItemRouteResult opt_route_item(Item p_item, boolean p_with_preferred_directions, boolean disableSnapshots) {
     // check if item.board is a RoutingBoard
     if (!(p_item.board instanceof RoutingBoard routingBoard)) {
@@ -319,6 +447,21 @@ public class BatchOptimizer extends NamedAlgorithm {
     if (progressThrottler.shouldUpdate()) {
       this.fireBoardUpdatedEvent(boardStatisticsBefore, routerCountersBefore, routingBoard);
     }
+
+    // Defect 31, second fault. Only a PASS initialises the length baseline; a task-fresh
+    // optimizer (the multi-threaded path constructs one per item) arrived here with 0.0,
+    // so the result read "length exploded from zero" and length-only improvements -- the
+    // majority class, 246 of 311 items in the single-threaded comparison -- could never
+    // register in a task.
+    //
+    // Seeded with the UNWEIGHTED length, because that is the metric ItemRouteResult
+    // compares against. The first version of this fix seeded the weighted length, which
+    // runs far larger -- so every task read "length improved" trivially, replacing
+    // wins-can-never-register with wins-always-register. Same wrong-metric disease,
+    // opposite sign. (The PASS path's own weighted-vs-unweighted mismatch is pre-existing
+    // upstream behaviour and deliberately untouched: one defect per change.)
+    this.min_cumulative_trace_length = lengthBaseline(
+        this.min_cumulative_trace_length, boardStatisticsBefore.traces.totalLength);
 
     // collect the items to be re-routed
     Set<Item> ripped_items = new TreeSet<>();
@@ -447,12 +590,6 @@ public class BatchOptimizer extends NamedAlgorithm {
   @Override
   protected NamedAlgorithmType getType() {
     return NamedAlgorithmType.OPTIMIZER;
-  }
-
-  private int calculateIncompleteCount(RoutingBoard board) {
-    DesignRulesChecker tempDrc = new DesignRulesChecker(board, null);
-    tempDrc.calculateAllIncompletes();
-    return tempDrc.getIncompleteCount();
   }
 
   /**

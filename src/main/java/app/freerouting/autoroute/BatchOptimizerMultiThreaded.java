@@ -1,6 +1,7 @@
 package app.freerouting.autoroute;
 
 import app.freerouting.board.Item;
+import app.freerouting.board.RoutingBoard;
 import app.freerouting.core.RouterCounters;
 import app.freerouting.core.RoutingJob;
 import app.freerouting.core.scoring.BoardStatistics;
@@ -22,6 +23,29 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
   private final BoardUpdateStrategy board_update_strategy;
   private final ItemSelectionStrategy item_selection_strategy;
   private final int thread_pool_size;
+
+  /**
+   * The single dispatch predicate for governed MT, shared by the headless scheduler and
+   * the GUI thread. Null-safe (a null width means defaults were not merged: run ST) and
+   * ceiling-aware BEFORE dispatch: a request that the core ceiling would clamp to 1
+   * runs the single-threaded optimizer honestly instead of a pool of one.
+   */
+  public static boolean shouldUseMultiThreaded(RoutingJob job) {
+    Integer requested = job.routerSettings.optimizer.maxThreads;
+    if (requested == null) {
+      return false;
+    }
+    int coreCeiling = Runtime.getRuntime().availableProcessors();
+    if (requested > 1 && Math.min(requested, coreCeiling) <= 1) {
+      // The decline must be as loud as the clamp: a one-core machine asked for width N
+      // runs the single-threaded optimiser, and the run says so instead of silently
+      // switching modes.
+      job.logWarning("Optimizer width " + requested + " not applied: this machine has "
+          + coreCeiling + " logical processor(s); running the single-threaded optimizer.");
+      return false;
+    }
+    return Math.min(requested, coreCeiling) > 1;
+  }
   private final ArrayList<Integer> item_ids = new ArrayList<>();
   private final HashMap<Integer, ItemRouteResult> result_map = new HashMap<>();
   private final ArrayList<BoardUpdateStrategy> hybrid_list = new ArrayList<>();
@@ -29,14 +53,29 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
   private ItemRouteResult best_route_result;
   private OptimizeRouteTask winning_candidate;
   private int num_tasks_finished;
-  private int update_count;
+  // volatile: incremented only under the class monitor (accepted master-board
+  // replacements), read by the pass thread's poll loop as the rate guard's stall signal.
+  private volatile int update_count;
   private CountDownLatch task_completion_signal = new CountDownLatch(1);
   private int hybrid_index = -1;
+
+  /** Measured cost of one board clone, cached per stage; 0 = not yet measured, -1 = measured unusable. */
+  private long perCloneBytes = 0L;
 
   public BatchOptimizerMultiThreaded(RoutingJob job) {
     super(job);
 
-    this.thread_pool_size = job.routerSettings.optimizer.maxThreads;
+    // Core count is a CEILING, never a target: a request wider than the machine is
+    // clamped, loudly. The default (2) is the measured quality point. Null-safe read:
+    // a job constructed without merged defaults still gets the measured default.
+    Integer requestedSetting = job.routerSettings.optimizer.maxThreads;
+    int requestedWidth = (requestedSetting == null) ? 2 : requestedSetting;
+    int coreCeiling = Runtime.getRuntime().availableProcessors();
+    this.thread_pool_size = Math.min(requestedWidth, coreCeiling);
+    if (this.thread_pool_size < requestedWidth) {
+      job.logWarning("Optimizer width " + requestedWidth + " clamped to " + this.thread_pool_size
+          + ": this machine has " + coreCeiling + " logical processors.");
+    }
     this.board_update_strategy = job.routerSettings.optimizer.boardUpdateStrategy;
     this.item_selection_strategy =
         job.routerSettings.optimizer.boardUpdateStrategy == BoardUpdateStrategy.GLOBAL_OPTIMAL ? ItemSelectionStrategy.SEQUENTIAL : job.routerSettings.optimizer.itemSelectionStrategy;
@@ -133,6 +172,19 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
     return won;
   }
 
+  /**
+   * The board a task should start from, at the moment the task actually RUNS.
+   *
+   * <p>Only the reference is read under the monitor. The copy itself happens outside the
+   * lock, which is safe because master boards are never mutated after publication in
+   * multi-threaded mode: tasks mutate only their own clones, and a win replaces the master
+   * by reference swap. Cloning under the monitor would serialise every worker behind copy
+   * time and reintroduce the bottleneck this design removes.
+   */
+  synchronized RoutingBoard currentMasterBoard() {
+    return this.board;
+  }
+
   private void replaceMasterRoutingBoardWithTheWinningCandidate() {
     this.board = winning_candidate.board;
 
@@ -153,9 +205,17 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
 
     this.sorted_route_items = new ReadSortedRouteItems();
 
-    if (current_item_selection_strategy() == ItemSelectionStrategy.PRIORITIZED && !result_map.isEmpty()) {
+    ItemSelectionStrategy selection = current_item_selection_strategy();
+    boolean ordered = (selection == ItemSelectionStrategy.PRIORITIZED
+        || selection == ItemSelectionStrategy.MOST_TO_GAIN);
+    if (ordered && !result_map.isEmpty()) {
       ArrayList<Integer> new_item_ids = new ArrayList<>();
-      PriorityQueue<ItemRouteResult> pq = new PriorityQueue<>();
+      // PRIORITIZED polishes the already-best first (natural order: best after-state
+      // first); MOST_TO_GAIN is the mirror bet -- rescue the worst first. Same data,
+      // reversed comparator, measured as separate strategies.
+      PriorityQueue<ItemRouteResult> pq = (selection == ItemSelectionStrategy.MOST_TO_GAIN)
+          ? new PriorityQueue<>(java.util.Comparator.reverseOrder())
+          : new PriorityQueue<>();
 
       for (Item item = sorted_route_items.next(); item != null; item = sorted_route_items.next()) {
         ItemRouteResult r = result_map.get(item.get_id_no());
@@ -176,7 +236,7 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
         item_ids.add(item.get_id_no());
       }
 
-      if (current_item_selection_strategy() == ItemSelectionStrategy.RANDOM) {
+      if (selection == ItemSelectionStrategy.RANDOM) {
         Collections.shuffle(item_ids);
       }
     }
@@ -209,10 +269,69 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
 
     prepare_next_round_of_route_items();
 
+    // Same limiter, same validation, same announcements as the single-threaded pass. This
+    // override used to bypass the limiter entirely, so on the GUI's default path (multi-
+    // threading on) neither the rate guard nor an explicit rounds cap ever applied.
+    // MEMORY BUDGET (phase C). Per-clone cost is measured from one real copy on the
+    // first pass (a GC-settled heap delta, same instrument racing uses) and cached for
+    // the stage. The budget caps pool width; a budget that cannot hold one clone REFUSES
+    // below, with the numbers named, and the stage runs single-threaded in place.
+    if (this.perCloneBytes == 0L) {
+      Runtime rt = Runtime.getRuntime();
+      System.gc();
+      long before = rt.totalMemory() - rt.freeMemory();
+      RoutingBoard probe = currentMasterBoard().deepCopy();
+      this.perCloneBytes = (rt.totalMemory() - rt.freeMemory()) - before;
+      if (probe != null && this.perCloneBytes <= 0) {
+        this.perCloneBytes = -1L; // measured, unusable; never re-probe every pass
+      }
+    }
+    Integer budgetMbSetting = OptimizerMemoryBudget.validateBudgetMb(
+        this.settings.optimizer.memoryBudgetMb, m -> job.logError(m, null));
+    long budgetBytes = budgetMbSetting != null
+        ? budgetMbSetting * 1048576L
+        : OptimizerMemoryBudget.defaultBudgetBytes(Runtime.getRuntime().maxMemory());
+    int budgetWidth = OptimizerMemoryBudget.effectiveWidth(
+        this.thread_pool_size, budgetBytes, this.perCloneBytes);
+    if (budgetWidth == 0) {
+      job.logError("MEMORY BUDGET REFUSED: budget " + (budgetBytes / 1048576)
+          + " MB cannot hold one board clone (measured " + (this.perCloneBytes / 1048576)
+          + " MB on this board). Running the optimisation pass single-threaded in place"
+          + " instead -- no clones, no pool.", null);
+      return super.opt_route_pass(p_pass_no, p_with_preferred_directions);
+    }
+    int effectiveWidth = budgetWidth;
+    if (effectiveWidth < this.thread_pool_size) {
+      // A first-class banked outcome, not a debug line: a run that silently degraded
+      // concurrency is a different experiment from one that did not.
+      job.logWarning("MEMORY BUDGET DEGRADED: optimizer width " + this.thread_pool_size
+          + " -> " + effectiveWidth + " (budget " + (budgetBytes / 1048576)
+          + " MB, one clone measured " + (this.perCloneBytes / 1048576) + " MB).");
+    }
+
+    Integer roundsSetting =
+        OptimizerPassLimiter.validateRounds(this.settings.optimizer.rounds, m -> job.logError(m, null));
+    boolean useRounds = roundsSetting != null;
+    int itemsToSchedule = useRounds ? Math.min(roundsSetting, item_ids.size()) : item_ids.size();
+    if (useRounds) {
+      job.logInfo(String.format(java.util.Locale.US,
+          "Optimization pass #%d will examine at most %d items (of %d); the automatic progress "
+          + "guard is off because router.optimizer.rounds was set.",
+          p_pass_no, itemsToSchedule, item_ids.size()));
+    }
+    // The rate guard watches accepted master-board updates, which only land mid-pass under
+    // GREEDY. Under GLOBAL_OPTIMAL the board is frozen until pass end, so the count would
+    // read as stalled on every working pass -- there the cap, the deadline and the
+    // between-pass threshold are the bounds.
+    boolean useRateGuard = !useRounds
+        && current_board_update_strategy() == BoardUpdateStrategy.GREEDY;
+    long tasksAtWindowStart = 0L;
+    int updatesAtWindowStart = update_count;
+
     best_route_result = new ItemRouteResult(-1);
     winning_candidate = null;
 
-    pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(thread_pool_size, r ->
+    pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(effectiveWidth, r ->
     {
       Thread t = new Thread(r);
       t.setUncaughtExceptionHandler((t1, e) -> job.logError("Exception in thread pool worker thread: " + t1, e));
@@ -220,16 +339,17 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
     });
 
     // One new optimizer task is initialized for each item to be re-rerouted, and we keep the best result in the end
-    for (int t = 0; t < item_ids.size(); t++) {
+    for (int t = 0; t < itemsToSchedule; t++) {
       int item_id = item_ids.get(t);
-      job.logDebug("Scheduling task #" + (t + 1) + " of " + item_ids.size() + " for item #" + item_id + ".");
+      final int taskNo = t + 1;
+      job.logDebug(() -> "Scheduling task #" + taskNo + " of " + item_ids.size() + " for item #" + item_id + ".");
 
       // We schedule just enough tasks to keep workers busy in order not to exhaust JVM memory so that it can run on systems without huge amount of RAM using the pool
       OptimizeRouteTask newTask = new OptimizeRouteTask(this, this.job, item_id, p_pass_no, p_with_preferred_directions);
       pool.execute(newTask);
     }
 
-    job.logDebug("All items are queued for execution, waiting for the tasks to finish.");
+    job.logDebug(() -> "All items are queued for execution, waiting for the tasks to finish.");
     pool.shutdown();
 
     boolean interrupted = false;
@@ -237,11 +357,34 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
     try {
       int i = 0;
       while (!pool.awaitTermination(1, TimeUnit.SECONDS)) {
-        job.logDebug("Running route optimizer on " + pool.getActiveCount() + " thread(s). Completed " + pool.getCompletedTaskCount() + " of " + pool.getTaskCount() + " tasks.");
+        job.logDebug(() -> "Running route optimizer on " + pool.getActiveCount() + " thread(s). Completed " + pool.getCompletedTaskCount() + " of " + pool.getTaskCount() + " tasks.");
 
         if (this.thread.isStopRequested()) {
+          // Deliver-then-stop: fall through to the hand-back below. A deadline or a
+          // cancel must not discard masters the workers already accepted -- returning
+          // here skipped the defect-31 hand-back and lost every win of the pass. A stop
+          // request is NOT an interrupt: the GLOBAL_OPTIMAL candidate replacement below
+          // must still run, or that strategy loses its wins on every deadline.
           pool.shutdownNow();
-          return best_route_result.improvement_percentage();
+          break;
+        }
+
+        if (useRateGuard) {
+          long tasksDone = pool.getCompletedTaskCount();
+          if (tasksDone - tasksAtWindowStart >= OptimizerPassLimiter.GUARD_WINDOW_WORK_UNITS) {
+            if (OptimizerPassLimiter.countWindowStalled(updatesAtWindowStart, update_count)) {
+              job.logInfo(String.format(java.util.Locale.US,
+                  "Stopping optimization pass #%d: no accepted board improvement across the "
+                  + "last %d completed tasks (%d of %d done). Continuing this pass will not "
+                  + "pay for itself.",
+                  p_pass_no, OptimizerPassLimiter.GUARD_WINDOW_WORK_UNITS,
+                  tasksDone, pool.getTaskCount()));
+              pool.shutdownNow();
+              break;
+            }
+            updatesAtWindowStart = update_count;
+            tasksAtWindowStart = tasksDone;
+          }
         }
       }
     } catch (InterruptedException ie) {
@@ -250,13 +393,33 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
       interrupted = true;
       pool.shutdownNow();
 
-      // Thread.currentThread().interrupt(); // Preserve interrupt status
+      Thread.currentThread().interrupt(); // Preserve interrupt status
     }
 
+    // Whatever ended the loop, the workers must actually be gone before this thread
+    // reads best_route_result / the winning candidate / the board: shutdownNow() only
+    // ASKS. Bounded -- a worker that ignores interruption for 10s is a defect we would
+    // rather see as a warning than as a torn read.
+    try {
+      if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
+        job.logWarning("Optimizer worker threads did not terminate within 10s of shutdown;"
+            + " results are read anyway and may miss the last accepted update.");
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
     pool = null;
 
     if (!interrupted && best_route_result.improved() && current_board_update_strategy() == BoardUpdateStrategy.GLOBAL_OPTIMAL) {
       replaceMasterRoutingBoardWithTheWinningCandidate();
+    }
+
+    // Defect 31: the winning board only ever reached THIS object's field. job.board --
+    // which is what the save, the report and the DRC read -- kept pointing at the original,
+    // so every accepted improvement was silently discarded at delivery. Measured before the
+    // fix: 41 accepted wins, delivered board byte-identical to running no optimiser at all.
+    if (this.board != job.board && this.board != null) {
+      job.board = this.board;
     }
 
     float route_improved = best_route_result.improvement_percentage();
@@ -276,10 +439,10 @@ public class BatchOptimizerMultiThreaded extends BatchOptimizer {
     BoardStatistics boardStatisticsAfter = board.get_statistics();
     this.fireBoardUpdatedEvent(boardStatisticsAfter, routerCounters, this.board);
 
-    job.logDebug(
-        "Finished optimizer pass #" + p_pass_no + " in " + minutes + " minutes " + sec + " seconds with " + update_count + " board updates using " + thread_pool_size + " thread(s) with '" + us
+    job.logDebug(() -> "Finished optimizer pass #" + p_pass_no + " in " + minutes + " minutes " + sec + " seconds with " + update_count + " board updates using " + thread_pool_size + " thread(s) with '" + us
             + "' strategy and '" + is + "' item selection strategy.");
-    job.logDebug("Route optimizer pass summary - Improved: " + best_route_result.improved() + ", interrupted: " + interrupted + ", via count: " + best_route_result.via_count() + ", trace length: "
+    final boolean wasInterrupted = interrupted;
+    job.logDebug(() -> "Route optimizer pass summary - Improved: " + best_route_result.improved() + ", interrupted: " + wasInterrupted + ", via count: " + best_route_result.via_count() + ", trace length: "
         + boardStatisticsAfter.traces.totalLength + ", via count delta: " + (boardStatisticsBefore.items.viaCount - best_route_result.via_count()) + ", trace length delta: " + (
         boardStatisticsBefore.traces.totalLength - boardStatisticsAfter.traces.totalLength) + ".");
 

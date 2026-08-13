@@ -54,6 +54,14 @@ public class CliSettings implements SettingsSource {
                     if (propertyName.startsWith("router.")) {
                         applyRouterSetting(settings, propertyName, value);
                     }
+                } else {
+                    // A "--flag" with no "=" used to fall through here doing nothing at
+                    // all: no warning, and its value token was not consumed either, so
+                    // BOTH arguments vanished and the run continued with the setting at
+                    // its default. Exit code 0, no message, wrong measurement.
+                    String error = validationErrorFor(arg);
+                    rejectedArguments.add(arg);
+                    FRLogger.error(error, null);
                 }
             } else if (arg.startsWith("-")) {
                 // Handle -flag value format
@@ -83,6 +91,33 @@ public class CliSettings implements SettingsSource {
 
         return settings;
     }
+
+    /**
+     * Why an argument cannot be honoured, or null when its FORM is acceptable.
+     *
+     * <p>Validates form only, never ownership: an unrecognised but well-formed
+     * {@code --some.flag=value} returns null, because settings belonging to other
+     * components (logging, GUI, API server) legitimately pass through this parser on
+     * their way elsewhere. Rejecting those here would break flags that work today.
+     *
+     * <p>Pure and package-private so the rule can be tested without building a settings
+     * object or parsing a whole command line.
+     */
+    static String validationErrorFor(String arg) {
+        if (arg == null || !arg.startsWith("--") || arg.contains("=")) {
+            return null;
+        }
+        return "Unrecognised argument form: '" + arg + "'. Long options require "
+                + "--name=value; the space-separated form '" + arg + " <value>' is NOT "
+                + "supported and would be silently ignored. This argument was NOT applied.";
+    }
+
+    /** Arguments refused during parsing, so a caller can decide whether to abort. */
+    public java.util.List<String> getRejectedArguments() {
+        return java.util.Collections.unmodifiableList(rejectedArguments);
+    }
+
+    private final java.util.List<String> rejectedArguments = new java.util.ArrayList<>();
 
     private void applyRouterSetting(RouterSettings settings, String propertyName, String value) {
         try {

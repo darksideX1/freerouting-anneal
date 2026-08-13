@@ -6,14 +6,24 @@ package app.freerouting.datastructures;
 @SuppressWarnings("unchecked")
 public class ArrayStack<p_element_type> {
 
+  /**
+   * Number of slots allocated up front, regardless of the depth hint. The stack grows on
+   * demand (see {@link #reallocate()}), so allocating the hint immediately costs memory
+   * that is almost never used: every tree-traversal call site passes a hint of 10000
+   * while typically pushing a few dozen nodes.
+   */
+  private static final int INITIAL_CAPACITY = 64;
+
   private int level = -1;
   private p_element_type[] node_arr;
 
   /**
-   * Creates a new instance of ArrayStack with an initial maximal capacity for p_max_stack_depth elements.
+   * Creates a new instance of ArrayStack. p_max_stack_depth is an expected-depth hint,
+   * not a fixed capacity: the stack starts small and grows as elements are pushed.
    */
   public ArrayStack(int p_max_stack_depth) {
-    node_arr = (p_element_type[]) new Object[p_max_stack_depth];
+    int initial_capacity = Math.max(1, Math.min(p_max_stack_depth, INITIAL_CAPACITY));
+    node_arr = (p_element_type[]) new Object[initial_capacity];
   }
 
   /**

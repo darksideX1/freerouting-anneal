@@ -3,6 +3,8 @@ package app.freerouting.logger;
 import app.freerouting.Freerouting;
 import app.freerouting.board.BasicBoard;
 import app.freerouting.debug.DebugControl;
+import java.util.function.Supplier;
+import app.freerouting.geometry.planar.IntBox;
 import app.freerouting.geometry.planar.Point;
 import java.text.DecimalFormat;
 import java.time.Duration;
@@ -29,9 +31,50 @@ public class FRLogger {
   private static final CopyOnWriteArrayList<TraceEventListener> traceEventListeners = new CopyOnWriteArrayList<>();
   public static boolean granularTraceEnabled = false;
   private static Logger logger;
+
   private static boolean enabled = true;
 
   private FRLogger() {
+  }
+
+  /**
+   * Formats a bounding box for diagnostics as {@code [(llx,lly)..(urx,ury)]}.
+   *
+   * <p>This existed four times verbatim -- in {@code BasicBoard},
+   * {@code ShapeSearchTree45Degree}, {@code ShapeSearchTree90Degree} and
+   * {@code Sorted45DegreeRoomNeighbours} -- plus once inlined in {@code MazeSearchAlgo}.
+   * Only the {@code BasicBoard} copy checked for null; that is the version kept, because a
+   * formatter that throws while describing a problem is worse than useless.
+   */
+  public static String formatBounds(IntBox p_bounds) {
+    if (p_bounds == null) {
+      return "null";
+    }
+    return "[(" + p_bounds.ll.x + "," + p_bounds.ll.y + ")..(" + p_bounds.ur.x + "," + p_bounds.ur.y + ")]";
+  }
+
+  /**
+   * The Log4j logger, created on first use.
+   *
+   * <p>Deliberately lazy, and deliberately NOT a {@code static final} initialised at class
+   * load. Log4j resolves its configuration on the first {@code getLogger} call, and
+   * {@link Log4j2ConfigurationFactory} reads the {@code freerouting.logging.*} system
+   * properties at that moment -- properties {@code main} sets from the command line. Making
+   * this eager would pin the logging configuration at FRLogger class-load, which can happen
+   * first, and the symptom would be silently wrong log levels rather than a failure.
+   *
+   * <p>This replaced twelve copies of the same {@code if (logger == null)} block. The race
+   * on the non-volatile field is benign: {@code getLogger} returns the same instance for the
+   * same name, so a lost update costs one redundant lookup and nothing else. Read once into
+   * a local so the field cannot change between the check and the return.
+   */
+  private static Logger logger() {
+    Logger local = logger;
+    if (local == null) {
+      local = LogManager.getLogger(Freerouting.class);
+      logger = local;
+    }
+    return local;
   }
 
   /**
@@ -136,10 +179,6 @@ public class FRLogger {
     if (!enabled) {
       return;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
     perfData.put(perfId.hashCode(), Instant.now());
   }
 
@@ -153,10 +192,6 @@ public class FRLogger {
     if (!enabled) {
       return 0.0;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
     return traceExit(perfId, null);
   }
 
@@ -172,10 +207,6 @@ public class FRLogger {
     if (!enabled) {
       return 0.0;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
     long timeElapsed = 0;
     try {
       timeElapsed = Duration
@@ -211,11 +242,7 @@ public class FRLogger {
     if (!enabled) {
       return null;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
-    logger.info(msg);
+    logger().info(msg);
 
     return logEntry;
   }
@@ -243,11 +270,7 @@ public class FRLogger {
     if (!enabled) {
       return null;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
-    logger.warn(msg);
+    logger().warn(msg);
 
     return logEntry;
   }
@@ -273,11 +296,7 @@ public class FRLogger {
     if (!enabled) {
       return null;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
-    logger.debug(msg);
+    logger().debug(msg);
 
     return null;
   }
@@ -306,14 +325,10 @@ public class FRLogger {
     if (!enabled) {
       return null;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
     if (exception == null) {
-      logger.error(msg);
+      logger().error(msg);
     } else {
-      logger.error(msg, exception);
+      logger().error(msg, exception);
     }
 
     return logEntry;
@@ -335,14 +350,23 @@ public class FRLogger {
    *
    * @return true if TRACE logging is enabled, false otherwise.
    */
+  /**
+   * Checks if DEBUG level logging is enabled.
+   *
+   * @return true if DEBUG logging is enabled, false otherwise.
+   */
+  public static boolean isDebugEnabled() {
+    if (!enabled) {
+      return false;
+    }
+    return logger().isDebugEnabled();
+  }
+
   public static boolean isTraceEnabled() {
     if (!enabled) {
       return false;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-    return logger.isTraceEnabled();
+    return logger().isTraceEnabled();
   }
 
   /**
@@ -355,11 +379,7 @@ public class FRLogger {
     if (!enabled) {
       return null;
     }
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
-    logger.trace(msg);
+    logger().trace(msg);
 
     return null;
   }
@@ -380,19 +400,55 @@ public class FRLogger {
    *                      This string is used by DebugControl to filter execution.
    * @param impactedPoints List of points that the operation focused on
    */
-  public static boolean trace(String method, String operation, String message, String impactedItems, Point[] impactedPoints) {
-    if (enabled) {
-      if (logger == null) {
-        logger = LogManager.getLogger(Freerouting.class);
-      }
+  /**
+   * Trace with deferred arguments.
+   *
+   * <p>The five-argument form is not a logging call: it runs
+   * {@code DebugControl.check(...)}, which implements single-step execution and can pause
+   * the router, and it publishes a {@link TraceEvent}. Because its {@code message} was an
+   * already-built String, callers wrapped it in {@code if (isTraceEnabled())} to avoid the
+   * concatenation -- and 38 of those guards therefore disabled the DEBUGGER whenever the
+   * level was above TRACE. A root logger of {@code Level.ALL} hid that by making every
+   * guard true.
+   *
+   * <p>The cure is not more guards. With suppliers nothing is built unless something will
+   * consume it, so the call site can drop its guard, and dropping the guard is what gives
+   * the debugger its breakpoint back.
+   *
+   * <p>All three expensive arguments are deferred, not just the message: at the hottest
+   * site the impacted-items string and {@code getImpactedPoints(...)} allocate too.
+   */
+  public static boolean trace(String method, String operation, Supplier<String> message,
+      Supplier<String> impactedItems, Supplier<Point[]> impactedPoints) {
+    boolean granular = enabled && granularTraceEnabled;
+    boolean debuggerActive = DebugControl.getInstance().isActive();
+    if (!granular && !debuggerActive) {
+      // The overwhelmingly common case. Field reads only; no supplier is invoked, so this
+      // costs strictly less than the guarded String form it replaces.
+      return false;
+    }
+    return trace(method, operation, message.get(), impactedItems.get(), impactedPoints.get());
+  }
 
-      if (granularTraceEnabled && (impactedItems.isEmpty() || DebugControl.getInstance().isInterested(impactedItems))) {
+  public static boolean trace(String method, String operation, String message, String impactedItems, Point[] impactedPoints) {
+    DebugControl debugControl = DebugControl.getInstance();
+    // Parse the impacted-items string ONCE. Both questions below used to parse it
+    // separately with the same regex, so every granular trace paid twice.
+    int netNo = debugControl.parseNetNo(impactedItems);
+
+    if (enabled) {
+      if (granularTraceEnabled && (impactedItems.isEmpty() || debugControl.isInterestedInNet(netNo))) {
         String formattedMessage = String.format("[%s] [%s] %s: %s", method, operation, message, impactedItems);
-        logger.trace(formattedMessage);
+        logger().trace(formattedMessage);
       }
     }
 
-    boolean wasInterestingTraceEvent = DebugControl.getInstance().check(operation, impactedItems);
+    // isActive() is precisely the null-settings guard plus the singleStep/delay
+    // early-return that check(String, String) performed BEFORE delegating. The
+    // three-argument overload does neither, so calling it directly without this would
+    // turn a null-settings run into a NullPointerException.
+    boolean wasInterestingTraceEvent =
+        debugControl.isActive() && debugControl.check(operation, netNo, null);
     if (wasInterestingTraceEvent) {
       publishTraceEvent(new TraceEvent(method, operation, message, impactedItems, impactedPoints, Instant.now()));
     }
@@ -422,10 +478,6 @@ public class FRLogger {
    * @return The Logger instance.
    */
   public static Logger getLogger() {
-    if (logger == null) {
-      logger = LogManager.getLogger(Freerouting.class);
-    }
-
     return logger;
   }
 

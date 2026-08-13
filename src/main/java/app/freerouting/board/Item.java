@@ -200,14 +200,43 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
     return precalculated_tree_shapes[p_index];
   }
 
-  private TileShape[] get_precalculated_tree_shapes(ShapeTree p_tree) {
-    if (this.search_trees_info == null) {
-      this.search_trees_info = new ItemSearchTreesInfo();
+  /**
+   * Returns the tree shape at p_index enlarged by p_half_clearance.
+   *
+   * <p>The clearance test enlarges every candidate obstacle by half the clearance, on every
+   * query: 6,081,227 calls for 20,271 distinct results on b2_power, the same shapes rebuilt
+   * about three hundred times each. Enlargement is a pure function of the shape and the
+   * distance, so each of those repeats is identical work.
+   */
+  public TileShape get_enlarged_tree_shape(ShapeTree p_tree, int p_index, int p_half_clearance) {
+    TileShape base_shape = get_tree_shape(p_tree, p_index);
+    if (base_shape == null) {
+      return null;
     }
-    TileShape[] precalculated_tree_shapes = this.search_trees_info.get_precalculated_tree_shapes(p_tree);
+    if (this.search_trees_info == null) {
+      return (TileShape) base_shape.enlarge(p_half_clearance);
+    }
+    return this.search_trees_info.enlarged(base_shape, p_half_clearance, p_tree);
+  }
+
+  private TileShape[] get_precalculated_tree_shapes(ShapeTree p_tree) {
+    // Read the field ONCE into a local. It is a plain, non-volatile, transient field on an
+    // Item that BatchOptimizerMultiThreaded shares between threads, and it used to be
+    // re-read three times across calculate_tree_shapes() -- an expensive call. Another
+    // thread could therefore null it, or this thread could observe a stale null, between
+    // the guard and the use, producing the intermittent
+    //   NullPointerException: ... because "this.search_trees_info" is null
+    // on both the GUI and headless paths. A local cannot become null after the guard, so
+    // the failure is removed rather than caught.
+    ItemSearchTreesInfo treesInfo = this.search_trees_info;
+    if (treesInfo == null) {
+      treesInfo = new ItemSearchTreesInfo();
+      this.search_trees_info = treesInfo;
+    }
+    TileShape[] precalculated_tree_shapes = treesInfo.get_precalculated_tree_shapes(p_tree);
     if (precalculated_tree_shapes == null) {
       precalculated_tree_shapes = this.calculate_tree_shapes((ShapeSearchTree) p_tree);
-      this.search_trees_info.set_precalculated_tree_shapes(precalculated_tree_shapes, p_tree);
+      treesInfo.set_precalculated_tree_shapes(precalculated_tree_shapes, p_tree);
     }
     return precalculated_tree_shapes;
   }
@@ -748,7 +777,7 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
    * Returns all corners of this item, which are used for displaying the ratsnest. To be overwritten in derived classes implementing the Connectable interface.
    */
   public Point[] get_ratsnest_corners() {
-    return new Point[0];
+    return Point.EMPTY;
   }
 
   @Override

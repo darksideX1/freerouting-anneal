@@ -40,7 +40,11 @@ public class SmdPinFanoutRoutingTest extends RoutingFixtureTest {
   public void test_Issue_508_BM06() {
     TestingSettings testSettingsSource = new TestingSettings();
     testSettingsSource.setMaxPasses(10);
-    testSettingsSource.setJobTimeoutString("00:02:00");
+    // 90s, not 2:00: the job budget must sit INSIDE the harness's 2-minute kill with room
+    // for the orderly stage finish. At exactly 2:00 the two race -- and the multi-threaded
+    // optimiser, which productively uses its whole budget where the old ST path converged
+    // early, loses that race and the harness reports a timeout instead of a result.
+    testSettingsSource.setJobTimeoutString("00:01:30");
 
     RoutingJob job = GetRoutingJob("Issue508-DAC2020_bm06.dsn", testSettingsSource);
     RunRoutingJob(job);

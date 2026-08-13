@@ -209,7 +209,9 @@ public class ShoveTraceAlgo {
         obstacleLog.append("}");
       }
       obstacleLog.append("]");
-      FRLogger.trace(obstacleLog.toString());
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace(obstacleLog.toString());
+      }
     }
 
     if (shape_entries.stack_depth() > 1) {
@@ -343,7 +345,9 @@ public class ShoveTraceAlgo {
         obstacleLog.append("}");
       }
       obstacleLog.append("]");
-      FRLogger.trace(obstacleLog.toString());
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace(obstacleLog.toString());
+      }
     }
     if (trace_piece_count == 0) {
       return true;

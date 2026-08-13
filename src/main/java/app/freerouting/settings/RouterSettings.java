@@ -46,6 +46,27 @@ public class RouterSettings implements Serializable, Cloneable {
   public String jobTimeoutString;
   @SerializedName("max_passes")
   public Integer maxPasses;
+  /**
+   * Whether to race several board copies per pass and keep the best result.
+   *
+   * <p>OFF by default, deliberately. It is not wired to {@code maxThreads} because that
+   * defaults to {@code availableProcessors - 1} -- fifteen on a modern box -- and a high
+   * core count is not consent to change how the router searches or how much memory it
+   * uses. Turn on by default only once it is measured to win.
+   */
+  /**
+   * Whether to race several board copies per pass and keep the best result.
+   *
+   * <p>DELIBERATELY NULL, not {@code false}. Every settings source constructs a
+   * {@code RouterSettings} and {@code ReflectionUtil.copyFields()} copies every non-null
+   * wrapper, so initialising this to {@code false} would make an unspecified setting
+   * indistinguishable from an explicit one -- {@code racing_enabled: true} from JSON would
+   * be overwritten by an empty environment source, and that by an empty CLI source, leaving
+   * the flag settable only from the last source in the merge order. Null means "this source
+   * said nothing"; the effective default is applied where it is read.
+   */
+  @SerializedName("racing_enabled")
+  public Boolean racingEnabled;
   @SerializedName("max_items")
   public transient Integer maxItems;
   @SerializedName("layers")
@@ -489,8 +510,22 @@ public class RouterSettings implements Serializable, Cloneable {
     enabled = p_value;
   }
 
+  /**
+   * The default scoring objective, freshly derived from {@code DefaultSettings} through the
+   * same merge path every run uses — not a hand-copied constant set that could drift from
+   * the real defaults (the dead-default defect, in scoring clothing).
+   */
+  public static ScoringSettings defaultScoringForOptimizer() {
+    return new SettingsMerger(
+        new app.freerouting.settings.sources.DefaultSettings()).merge().scoring;
+  }
+
   public boolean getRunOptimizer() {
-    return optimizer != null && optimizer.enabled != null ? optimizer.enabled : false;
+    // Falls back to the same value DefaultSettings assigns. It used to fall back to
+    // false while the real default was true: unreachable through the merger today, but
+    // wrong-signed, so any future path reading this before the merge would silently report
+    // the optimiser disabled. Same shape as the maxConsecutiveFailures/150 dead default.
+    return optimizer != null && optimizer.enabled != null ? optimizer.enabled : true;
   }
 
   public void setRunOptimizer(boolean p_value) {

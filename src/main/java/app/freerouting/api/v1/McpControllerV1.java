@@ -35,6 +35,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
+import java.time.Duration;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
@@ -48,6 +49,103 @@ import java.util.UUID;
 @Path("/v1/mcp")
 @Tag(name = "MCP", description = "Model Context Protocol endpoints for LLM tool integration")
 public class McpControllerV1 extends BaseController {
+
+  /**
+   * How long a bridge call may spend connecting, and how long it may take overall.
+   *
+   * <p>Every {@code tools/*} request is served by a Jetty worker that then makes an HTTP
+   * call back into this same process. Those calls had NO timeout of either kind -- there
+   * was not one {@code .timeout(} in this controller -- so a worker could block forever
+   * waiting on a socket it was itself responsible for serving. That is a deadlock whenever
+   * the pool is smaller than the number of in-flight bridge calls, and the CI runner with
+   * the fewest cores found it first: McpEndpointsTest hung for a whole 9-minute job on
+   * windows-latest while passing on ubuntu and macos. The platform did not cause it; it
+   * just lost the race more reliably.
+   *
+   * <p>A bound nobody reaches is not a bound, so these are deliberately short relative to
+   * any job budget. Exceeding one produces a reported error instead of a hang.
+   */
+  static final Duration BRIDGE_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+
+  static final Duration BRIDGE_REQUEST_TIMEOUT = Duration.ofSeconds(30);
+
+  /**
+   * One client for every bridge call.
+   *
+   * <p>This was {@code HttpClient.newHttpClient()} at three call sites -- a NEW client per
+   * request, never closed. Each one owns a selector thread and an executor, so the old code
+   * leaked both on every MCP tool call, which is its own way of hanging a JVM at shutdown.
+   */
+  private static final HttpClient BRIDGE_CLIENT = HttpClient.newBuilder()
+      .connectTimeout(BRIDGE_CONNECT_TIMEOUT)
+      .build();
+
+  /** The shared bridge client; package-private so the bound can be asserted in a test. */
+  static HttpClient bridgeClient() {
+    return BRIDGE_CLIENT;
+  }
+
+  /** A bridge request builder that always carries the request timeout. */
+  static HttpRequest.Builder bridgeRequestBuilder(java.net.URI uri) {
+    return HttpRequest.newBuilder(uri).timeout(BRIDGE_REQUEST_TIMEOUT);
+  }
+
+  private static volatile Application cachedRegistryApplication;
+  private static volatile OpenApiMcpToolRegistry cachedRegistry;
+
+  /**
+   * The MCP tool inventory, built once per {@link Application} rather than per request.
+   *
+   * <p>This is the path that actually hangs. {@code tools/list} never makes an HTTP call,
+   * so the bridge timeouts added alongside this cannot reach it -- a correction owed to the
+   * PR review, which caught that the first fix bounded a different path from the one the
+   * Windows log stops in.
+   *
+   * <p>{@code OpenApiMcpToolRegistry.fromApplication} runs a JAX-RS/Swagger CLASSPATH SCAN
+   * of the whole {@code app.freerouting.api} package and rebuilds the entire OpenAPI model.
+   * That was happening on EVERY {@code tools/list} request. The inventory cannot change
+   * while the application is running, so rebuilding it per request is pure waste as well as
+   * an unbounded amount of work on a Jetty worker.
+   *
+   * <p>Keyed on the Application instance so tests that stand up a fresh server get a fresh
+   * registry rather than a stale one from a previous fixture.
+   */
+  static OpenApiMcpToolRegistry toolRegistry(Application application) throws Exception {
+    OpenApiMcpToolRegistry local = cachedRegistry;
+    if (local != null && cachedRegistryApplication == application) {
+      return local;
+    }
+    local = OpenApiMcpToolRegistry.fromApplication(application);
+    cachedRegistry = local;
+    cachedRegistryApplication = application;
+    return local;
+  }
+
+  /**
+   * Send a bridge request, bounding COMPLETION rather than only the headers.
+   *
+   * <p>{@code HttpRequest.Builder.timeout} stops governing the exchange once response
+   * headers arrive, so {@code send(.., ofString())} can still block forever on a target
+   * that sends headers and then stalls -- which would pin a Jetty worker exactly as before.
+   * Also owed to the PR review.
+   */
+  private static HttpResponse<String> sendBounded(HttpRequest request)
+      throws IOException, InterruptedException {
+    try {
+      return BRIDGE_CLIENT
+          .sendAsync(request, HttpResponse.BodyHandlers.ofString())
+          .get(BRIDGE_REQUEST_TIMEOUT.toSeconds() + 5, java.util.concurrent.TimeUnit.SECONDS);
+    } catch (java.util.concurrent.TimeoutException e) {
+      throw new IOException("MCP bridge call did not complete within "
+          + (BRIDGE_REQUEST_TIMEOUT.toSeconds() + 5) + "s: " + request.uri(), e);
+    } catch (java.util.concurrent.ExecutionException e) {
+      Throwable cause = e.getCause();
+      if (cause instanceof IOException io) {
+        throw io;
+      }
+      throw new IOException("MCP bridge call failed: " + request.uri(), cause);
+    }
+  }
 
   private static final String JSONRPC_VERSION = "2.0";
   private static volatile String detectedClientInfo = "MCP-Client/1.0";
@@ -184,7 +282,7 @@ public class McpControllerV1 extends BaseController {
   }
 
   private JsonObject handleToolsList(JsonElement id) throws Exception {
-    OpenApiMcpToolRegistry registry = OpenApiMcpToolRegistry.fromApplication(application);
+    OpenApiMcpToolRegistry registry = toolRegistry(application);
 
     JsonObject result = new JsonObject();
     result.add("tools", registry.toMcpToolsArray());
@@ -203,7 +301,7 @@ public class McpControllerV1 extends BaseController {
         ? params.getAsJsonObject("arguments")
         : new JsonObject();
 
-    OpenApiMcpToolRegistry registry = OpenApiMcpToolRegistry.fromApplication(application);
+    OpenApiMcpToolRegistry registry = toolRegistry(application);
     OpenApiMcpToolRegistry.ToolOperation tool = registry.get(toolName);
 
     if (tool == null) {
@@ -253,7 +351,7 @@ public class McpControllerV1 extends BaseController {
     String resolvedPath = resolvePath(tool.path(), getObject(arguments, "path"));
     URI uri = buildUriWithQuery(resolvedPath, getObject(arguments, "query"));
 
-    HttpRequest.Builder builder = HttpRequest.newBuilder(uri);
+    HttpRequest.Builder builder = bridgeRequestBuilder(uri);
     forwardHeaders(builder, correlationId);
 
     JsonElement bodyElement = arguments.get("body");
@@ -266,7 +364,7 @@ public class McpControllerV1 extends BaseController {
       builder.method(method, HttpRequest.BodyPublishers.noBody());
     }
 
-    return HttpClient.newHttpClient().send(builder.build(), HttpResponse.BodyHandlers.ofString());
+    return sendBounded(builder.build());
   }
 
   private void forwardHeaders(HttpRequest.Builder builder, String correlationId) {
@@ -468,12 +566,12 @@ public class McpControllerV1 extends BaseController {
         requestBodyObj.addProperty("job_id", jobId);
         requestBodyObj.addProperty("data", base64Data);
 
-        HttpRequest.Builder builder = HttpRequest.newBuilder(uri);
+        HttpRequest.Builder builder = bridgeRequestBuilder(uri);
         forwardHeaders(builder, correlationId);
         builder.header("Content-Type", MediaType.APPLICATION_JSON);
         builder.POST(HttpRequest.BodyPublishers.ofString(requestBodyObj.toString(), StandardCharsets.UTF_8));
 
-        HttpResponse<String> response = HttpClient.newHttpClient().send(builder.build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendBounded(builder.build());
         payload.addProperty("status", response.statusCode());
         payload.addProperty("contentType", "application/json");
         isError = response.statusCode() >= 400;
@@ -498,11 +596,11 @@ public class McpControllerV1 extends BaseController {
 
       try {
         URI uri = buildUriWithQuery("/v1/jobs/" + jobId + "/output", new JsonObject());
-        HttpRequest.Builder builder = HttpRequest.newBuilder(uri);
+        HttpRequest.Builder builder = bridgeRequestBuilder(uri);
         forwardHeaders(builder, correlationId);
         builder.GET();
 
-        HttpResponse<String> response = HttpClient.newHttpClient().send(builder.build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendBounded(builder.build());
         payload.addProperty("status", response.statusCode());
         payload.addProperty("contentType", "application/json");
         isError = response.statusCode() >= 400;

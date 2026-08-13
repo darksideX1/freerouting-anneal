@@ -25,8 +25,10 @@ import app.freerouting.geometry.planar.TileShape;
 import app.freerouting.logger.FRLogger;
 import app.freerouting.rules.BoardRules;
 import app.freerouting.rules.ClearanceMatrix;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -442,7 +444,7 @@ public class ShapeSearchTree extends MinAreaTree {
     RegularTileShape offset_bounds = (RegularTileShape) bounds.offset(max_clearance);
     Collection<Leaf> tmp_list = overlaps(offset_bounds);
     // sort the found items by its clearances tp p_cl_type on layer p_layer
-    Set<EntrySortedByClearance> sorted_items = new TreeSet<>();
+    List<EntrySortedByClearance> candidates = new ArrayList<>();
 
     for (Leaf curr_leaf : tmp_list) {
       Item curr_item = (Item) curr_leaf.object;
@@ -458,9 +460,10 @@ public class ShapeSearchTree extends MinAreaTree {
       if (!ignore_item) {
         int curr_clearance = cl_matrix.get_value(p_cl_type, curr_item.clearance_class_no(), p_layer, true);
         EntrySortedByClearance sorted_ob = new EntrySortedByClearance(curr_leaf, curr_clearance);
-        sorted_items.add(sorted_ob);
+        candidates.add(sorted_ob);
       }
     }
+    List<EntrySortedByClearance> sorted_items = sortByClearance(candidates);
     int curr_half_clearance = 0;
     ConvexShape curr_offset_shape = p_shape;
     for (EntrySortedByClearance tmp_entry : sorted_items) {
@@ -469,10 +472,12 @@ public class ShapeSearchTree extends MinAreaTree {
         curr_half_clearance = tmp_half_clearance;
         curr_offset_shape = (TileShape) p_shape.enlarge(curr_half_clearance);
       }
-      TileShape tmp_shape = tmp_entry.leaf.object.get_tree_shape(this, tmp_entry.leaf.shape_index_in_object);
-      // enlarge both item shapes by the half clearance to create
-      // symmetry.
-      ConvexShape tmp_offset_shape = (ConvexShape) tmp_shape.enlarge(curr_half_clearance);
+      // Enlarge both item shapes by the half clearance to create symmetry. The obstacle
+      // side is computed once per shape instance rather than once per query -- the same
+      // enlargement is asked for around three hundred times, and it is a pure function of
+      // the shape and the distance.
+      ConvexShape tmp_offset_shape = (ConvexShape) tmp_entry.leaf.object.get_enlarged_tree_shape(
+          this, tmp_entry.leaf.shape_index_in_object, curr_half_clearance);
       if (curr_offset_shape.intersects(tmp_offset_shape)) {
         p_obstacle_entries.add(new TreeEntry(tmp_entry.leaf.object, tmp_entry.leaf.shape_index_in_object));
       }
@@ -597,6 +602,17 @@ public class ShapeSearchTree extends MinAreaTree {
     // v1.9's "natural" order was based on its tree structure.
     // Sorting with Leaf's natural comparison (which uses item id_no and shape_index)
     // provides a stable visit order.
+    // NOTE: this sort can throw NullPointerException from Leaf.compareTo when an item is
+    // removed concurrently -- MinAreaTree.remove_leaf nulls the leaf's object BEFORE the
+    // replacement leaf is inserted, and compareTo dereferences it unguarded.
+    //
+    // Do NOT "fix" that by skipping leaves whose object is null. It was tried and
+    // reverted. A null object does not mean the obstacle is gone; it means the obstacle
+    // is mid-re-registration. Skipping it omits real copper from the overlap calculation
+    // and routes a trace straight through it, turning a loud crash into a silent
+    // clearance violation in a board somebody manufactures. The crash is the safer
+    // failure. The real fix is to synchronise traversal against mutation, which changes
+    // this tree's concurrency contract and is deliberately not attempted here.
     Collections.sort(overlapping_leaves);
 
     for (Leaf curr_leaf : overlapping_leaves) {
@@ -617,14 +633,16 @@ public class ShapeSearchTree extends MinAreaTree {
           if (intersection.dimension() == 2) {
             boolean ignore_expansion_room = curr_object instanceof CompleteFreeSpaceExpansionRoom
                 && p_ignore_shape != null && p_ignore_shape.contains(intersection);
-            FRLogger.trace("COMPLETE_SHAPE_DECISION"
-                + ", net=" + p_net_no
-                + ", layer=" + room_layer
-                + ", action=" + (ignore_expansion_room ? "IGNORE" : "RESTRAIN")
-                + ", obstacle_type=" + curr_object.getClass().getSimpleName()
-                + ", obstacle_bounds=" + curr_object_shape.bounding_box()
-                + ", overlap_bounds=" + intersection.bounding_box()
-                + ", ignore_bounds=" + (p_ignore_shape == null ? "null" : p_ignore_shape.bounding_box()));
+            if (FRLogger.isTraceEnabled()) {
+              FRLogger.trace("COMPLETE_SHAPE_DECISION"
+                  + ", net=" + p_net_no
+                  + ", layer=" + room_layer
+                  + ", action=" + (ignore_expansion_room ? "IGNORE" : "RESTRAIN")
+                  + ", obstacle_type=" + curr_object.getClass().getSimpleName()
+                  + ", obstacle_bounds=" + curr_object_shape.bounding_box()
+                  + ", overlap_bounds=" + intersection.bounding_box()
+                  + ", ignore_bounds=" + (p_ignore_shape == null ? "null" : p_ignore_shape.bounding_box()));
+            }
 
             if (!ignore_expansion_room) {
               something_changed = true;
@@ -686,7 +704,9 @@ public class ShapeSearchTree extends MinAreaTree {
       // as an octagon
     }
     if (shape_to_be_contained == null || shape_to_be_contained.is_empty()) {
-      FRLogger.trace("ShapeSearchTree.restrain_shape: p_shape_to_be_contained is empty");
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("ShapeSearchTree.restrain_shape: p_shape_to_be_contained is empty");
+      }
       return result;
     }
     Line cut_line = null;
@@ -1099,7 +1119,35 @@ public class ShapeSearchTree extends MinAreaTree {
    * created for sorting Items according to their clearance to p_cl_type on layer
    * p_layer
    */
-  private static class EntrySortedByClearance implements Comparable<EntrySortedByClearance> {
+  /**
+   * Orders the overlap candidates by clearance, smallest first.
+   *
+   * <p>Extracted so the ordering can be tested on its own. The loop that consumes the result
+   * only recomputes the enlarged shape when the clearance CHANGES, so it depends on this
+   * being grouped by clearance -- and it must receive every candidate it was given, because
+   * a candidate that never arrives is a clearance check that never runs.
+   */
+  static List<EntrySortedByClearance> sortByClearance(List<EntrySortedByClearance> p_candidates) {
+    // Sorted in place: the caller builds this list for us and nobody else holds it, and this
+    // runs in the second-hottest allocation site on the board, so a defensive copy per call
+    // is a real cost for no reader.
+    //
+    // This was a TreeSet. A Set was never wanted -- the comparator is a total order, so it
+    // never actually deduplicated while the tie-breaking ids stayed unique. It only started
+    // deduplicating when they collided, which is precisely when it must not: the ids come
+    // from an unsynchronised static counter, and racing threads can be handed the same one.
+    // The Set would then discard a real obstacle and the clearance check for it would never
+    // run (defect 27).
+    //
+    // A stable sort on clearance alone gives the same sequence as the old (clearance, id)
+    // ordering, because the ids were handed out in insertion order -- so single-threaded
+    // output is unchanged -- while making the drop structurally impossible rather than
+    // merely unlikely.
+    p_candidates.sort(Comparator.comparingInt(entry -> entry.clearance));
+    return p_candidates;
+  }
+
+  static class EntrySortedByClearance implements Comparable<EntrySortedByClearance> {
 
     private final int entry_id_no;
     Leaf leaf;

@@ -191,13 +191,13 @@ public class RatsNest {
       }
     }
     FRLogger.trace("RatsNest.incomplete_count", "total_incomplete_count",
-        "RatsNest total incomplete count=" + result,
-        "RatsNest",
-        new app.freerouting.geometry.planar.Point[0]);
+        () -> "RatsNest total incomplete count=" + result,
+        () -> "RatsNest",
+        () -> app.freerouting.geometry.planar.Point.EMPTY);
     FRLogger.trace("RatsNest.incomplete_count", "net_breakdown",
-        "RatsNest incomplete net breakdown=" + perNet,
-        "RatsNest",
-        new app.freerouting.geometry.planar.Point[0]);
+        () -> "RatsNest incomplete net breakdown=" + perNet,
+        () -> "RatsNest",
+        () -> app.freerouting.geometry.planar.Point.EMPTY);
     return result;
   }
 
@@ -224,9 +224,9 @@ public class RatsNest {
   public int incomplete_count(int p_net_no) {
     int result = drc.getIncompleteCount(p_net_no);
     FRLogger.trace("RatsNest.incomplete_count", "net_incomplete_count",
-        "RatsNest net=" + p_net_no + " incomplete_count=" + result,
-        "Net #" + p_net_no,
-        new app.freerouting.geometry.planar.Point[0]);
+        () -> "RatsNest net=" + p_net_no + " incomplete_count=" + result,
+        () -> "Net #" + p_net_no,
+        () -> app.freerouting.geometry.planar.Point.EMPTY);
     return result;
   }
 

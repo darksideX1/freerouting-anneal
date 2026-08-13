@@ -93,6 +93,8 @@ public class GlobalSettings implements Serializable {
   @SerializedName("version")
   public String version;
   public transient boolean show_help_option;
+  /** --helpful: the extended manual, not just the flag list. */
+  public transient boolean show_helpful_option;
   public transient String compareFile1;
   public transient String compareFile2;
   // DRC report file details that we got from the command line arguments.
@@ -295,16 +297,21 @@ public class GlobalSettings implements Serializable {
           FRLogger.warn("freerouting.json at '" + configurationFilePath
               + "' was written by an older version of Freerouting (file: " + fileVersion
               + ", current: " + currentVersion + "). "
-              + "No migration logic is implemented for this version transition, so some settings "
-              + "may have been reset to their defaults. "
+              + "Settings that still apply have been kept. "
               + "The file will be re-saved with the updated version string.");
         } else if (cmp > 0) {
           // File was written by a newer version — downgrade scenario.
+          // Deliberately does NOT tell anyone to go back to the version that wrote this
+          // file. This program is a fork with its own version sequence, so a higher number
+          // here usually means the file came from upstream Freerouting rather than from a
+          // later build of this program -- and every user upgrading from upstream 2.3.x hits
+          // this branch on first run. Advising them to revert would send all of them back to
+          // the router this release exists to replace.
           FRLogger.warn("freerouting.json at '" + configurationFilePath
-              + "' was written by a newer version of Freerouting (file: " + fileVersion
+              + "' was written by a different version (file: " + fileVersion
               + ", current: " + currentVersion + "). "
-              + "Some settings from the newer version may not be understood or may be ignored. "
-              + "Consider upgrading Freerouting to the version that originally wrote this file.");
+              + "Settings that still apply have been kept; any this version does not "
+              + "recognise are ignored. The file will be re-saved.");
         }
       }
 
@@ -321,8 +328,15 @@ public class GlobalSettings implements Serializable {
         // TODO: insert per-version migration steps here when needed, e.g.:
         //   migrateSettings(fileVersion, currentVersion, defaultSettings);
         FRLogger.info("freerouting.json config version changed from '"
-            + fileVersion + "' to '" + currentVersion + "' – re-saving configuration.");
-        saveAsJson(defaultSettings);
+            + fileVersion + "' to '" + currentVersion + "' – configuration will be "
+            + "re-saved once startup commits to a real run.");
+        // Deferred, not written here: load() also runs for --help/--helpful, and a help
+        // invocation must never mutate configuration on disk. The main flow flushes this
+        // after the help early-exits. SNAPSHOT, not reference: the loaded object becomes
+        // the live settings and accumulates CLI/runtime state before the flush runs --
+        // persisting that would write -de/-do and friends into the config file.
+        migrationSavePending = GsonProvider.GSON.fromJson(
+            GsonProvider.GSON.toJson(defaultSettings), GlobalSettings.class);
       }
       loadedSettings = defaultSettings;
     }
@@ -389,6 +403,65 @@ public class GlobalSettings implements Serializable {
    * Property names are in the format of "section.property" (eg.
    * "router.max_passes", "gui:input_directory" or "profile-email").
    */
+  /** Set when load() migrated the config version; written by flushPendingMigrationSave(). */
+  private static volatile GlobalSettings migrationSavePending;
+
+  /** Performs the migration re-save deferred by load(). Called only on paths that commit
+   *  to a real run -- never on --help/--helpful, which must not write configuration. */
+  public static synchronized void flushPendingMigrationSave() {
+    GlobalSettings pending = migrationSavePending;
+    if (pending == null) {
+      return;
+    }
+    migrationSavePending = null;
+    try {
+      saveAsJson(pending);
+    } catch (Exception e) {
+      FRLogger.error("Failed to re-save migrated configuration", e);
+    }
+  }
+
+  /**
+   * The durable per-user home for configuration and logs. The inherited default was the
+   * JVM temp directory, which any reboot or tmp cleanup wipes -- so "check the log"
+   * pointed at a file that no longer existed and settings silently reset. Platform
+   * app-data is what survives; temp remains only as the last resort when no home
+   * directory is resolvable.
+   */
+  public static java.nio.file.Path defaultUserDataPath() {
+    String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+    if (os.contains("win")) {
+      String appData = System.getenv("APPDATA");
+      if (appData != null && !appData.isBlank()) {
+        return java.nio.file.Path.of(appData, "freerouting");
+      }
+      // APPDATA unset (service accounts, minimal environments): user.home is still a
+      // durable location and MUST be preferred -- temp is the last resort, not the
+      // second choice.
+      String home = System.getProperty("user.home");
+      if (home != null && !home.isBlank()) {
+        return java.nio.file.Path.of(home, "AppData", "Roaming", "freerouting");
+      }
+    } else if (os.contains("mac")) {
+      String home = System.getProperty("user.home");
+      if (home != null && !home.isBlank()) {
+        return java.nio.file.Path.of(home, "Library", "Application Support", "freerouting");
+      }
+    } else {
+      String xdg = System.getenv("XDG_DATA_HOME");
+      // The XDG spec requires absolute paths; a relative value would make the default
+      // depend on the launch directory, so it is ignored rather than obeyed.
+      if (xdg != null && !xdg.isBlank() && java.nio.file.Path.of(xdg).isAbsolute()) {
+        return java.nio.file.Path.of(xdg, "freerouting");
+      }
+      String home = System.getProperty("user.home");
+      if (home != null && !home.isBlank()) {
+        return java.nio.file.Path.of(home, ".local", "share", "freerouting");
+      }
+    }
+    return java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "freerouting");
+  }
+
   public static Boolean setDefaultValue(String propertyName, String newValue) {
     try {
       var gs = load();
@@ -434,17 +507,94 @@ public class GlobalSettings implements Serializable {
    * Property names are in the format of "section.property" (eg.
    * "router.max_passes", "gui:input_directory" or "profile-email").
    */
+  /**
+   * Why the most recent {@link #setValue} failed, for callers that report the refusal.
+   *
+   * <p>Kept as state rather than folded into the return type because {@code setValue}
+   * returns {@code Boolean} to GUI callers that only care whether it worked. The refusal
+   * message is the one the user actually reads, and it previously hardcoded "unknown
+   * settings property" for BOTH failure modes -- so a valid property with an unparseable
+   * value reported that the property did not exist. That is the wrong signpost, and this
+   * exists so the caller can print the right one.
+   */
+  private transient String lastSetValueFailureReason = "unknown settings property";
+
+  String getLastSetValueFailureReason() {
+    return lastSetValueFailureReason;
+  }
+
   public Boolean setValue(String propertyName, String newValue) {
     try {
       ReflectionUtil.setFieldValue(this, propertyName, newValue);
       return true;
+    } catch (IllegalArgumentException e) {
+      // NOT an unknown property. The name resolved perfectly and the VALUE could not be
+      // converted to the field's type. Reporting this as "unknown settings property" is
+      // how defect 26 stayed hidden: the message sent readers hunting for a misspelling
+      // while the name had been right all along. Say which of the two it is.
+      FRLogger.error("Settings property '" + propertyName + "' exists, but the value '"
+          + newValue + "' could not be converted to its type: " + e.getMessage(), null);
+      lastSetValueFailureReason = "value cannot be converted to the property's type";
+      return false;
     } catch (NoSuchFieldException e) {
       FRLogger.warn("Unknown settings property: " + propertyName);
+      lastSetValueFailureReason = "unknown settings property";
       return false;
     } catch (Exception e) {
       FRLogger.error("Failed to set property value for: " + propertyName, e);
       return false;
     }
+  }
+
+  /** Command-line arguments the program could not honour, in the order seen. */
+  private final java.util.List<String> rejectedArguments = new java.util.ArrayList<>();
+
+  /**
+   * Arguments that were refused, so startup can decide whether to abort.
+   *
+   * <p>Kept as a list rather than a count because the user needs to be told WHICH setting
+   * did not apply; "one argument was ignored" sends them hunting.
+   */
+  public java.util.List<String> getRejectedArguments() {
+    return java.util.Collections.unmodifiableList(rejectedArguments);
+  }
+
+  private void rejectArgument(String argument, String reason) {
+    rejectedArguments.add(argument);
+    FRLogger.error("Argument NOT applied (" + reason + "): '" + argument
+        + "'. The run is not configured as requested.", null);
+  }
+
+  /**
+   * Whether a headless run reports its outcome through the process exit status.
+   *
+   * <p>Off by default, and deliberately so. An incomplete board is the NORMAL result for
+   * an autorouter -- connections it could not route are handed back to the engineer, who
+   * moves components and tries again. Turning distinct codes on by default would make
+   * every existing CI job that tests {@code $? -eq 0} start failing on boards that are
+   * behaving exactly as expected.
+   */
+  @SerializedName("outcome_exit_codes")
+  public Boolean outcomeExitCodes = false;
+
+  /**
+   * Options consumed at startup, before any settings object exists.
+   *
+   * <p>These have no field in the settings model by design -- {@code logging.file.pattern}
+   * has to configure logging before there is a model to hold it, and
+   * {@code user_data_path} decides where that model is even read from. The registry check
+   * would therefore find nothing, refuse them, and log an ERROR saying the run was not
+   * configured as requested, about options that HAD been applied. A false alarm is worse
+   * than the silence it replaced: it teaches people to ignore the alarms that are real.
+   *
+   * <p>Named and narrow on purpose. This must never become a way to quieten the check --
+   * a neighbouring but genuinely unknown option is still refused. It replaces an inline
+   * string comparison that was repeated at two call sites, where the second was easy to
+   * miss when adding the next one.
+   */
+  static boolean isBootstrapOwnedOption(String name) {
+    return Objects.equals(name, "user_data_path")
+        || Objects.equals(name, "logging.file.pattern");
   }
 
   public Locale getCurrentLocale() {
@@ -454,7 +604,12 @@ public class GlobalSettings implements Serializable {
   public void applyCommandLineArguments(String[] p_args) {
     for (int i = 0; i < p_args.length; i++) {
       try {
-        if (p_args[i].equalsIgnoreCase("-help") || p_args[i].equalsIgnoreCase("--help") || p_args[i].equalsIgnoreCase("-h")) {
+        if (p_args[i].equalsIgnoreCase("-helpful") || p_args[i].equalsIgnoreCase("--helpful")) {
+          // Checked BEFORE --help: "--helpful" starts with "--help", and an equalsIgnoreCase
+          // chain that tested --help first would still miss it, but a future startsWith would
+          // not. Order it defensively so the longer flag can never be swallowed.
+          show_helpful_option = true;
+        } else if (p_args[i].equalsIgnoreCase("-help") || p_args[i].equalsIgnoreCase("--help") || p_args[i].equalsIgnoreCase("-h")) {
           show_help_option = true;
           continue;
         }
@@ -473,7 +628,7 @@ public class GlobalSettings implements Serializable {
           String[] parts = p_args[i]
               .substring(2)
               .split("=", 2);
-          if ((parts.length == 2) && (!Objects.equals(parts[0], "user_data_path"))) {
+          if ((parts.length == 2) && !isBootstrapOwnedOption(parts[0])) {
             if (parts[0].startsWith("debug.")) {
               // handle debug settings
               if (parts[0].equals("debug.enable_detailed_logging")) {
@@ -487,11 +642,30 @@ public class GlobalSettings implements Serializable {
                 for (String net : nets) {
                   debugSettings.filterByNet.add(net.trim().toLowerCase());
                 }
+              } else {
+                // No final else here meant an unrecognised debug flag matched nothing and
+                // was dropped in silence, leaving the user certain they had enabled it.
+                rejectArgument(p_args[i], "unrecognised debug setting");
               }
-            } else {
-              setValue(parts[0], parts[1]);
+            } else if (!setValue(parts[0], parts[1])) {
+              // Was hardcoded to "unknown settings property", which is a lie whenever the
+              // name resolved and the VALUE was the problem.
+              // setValue already answers this question and every caller used to discard
+              // the answer. An unresolvable name is not a note to file -- it means the run
+              // is not doing what it was told to do.
+              rejectArgument(p_args[i], getLastSetValueFailureReason());
             }
-          } else if (!Objects.equals(parts[0], "user_data_path")) {
+          } else if (p_args[i].equalsIgnoreCase("--helpful")) {
+            // Handled by the earlier parser. Named here so this loop does not warn that a
+            // flag which just printed a manual is unknown -- three parsers see every
+            // argument, and a new flag has to be known to all of them or the app contradicts
+            // itself in its own output.
+            show_helpful_option = true;
+          } else if (!((parts.length == 2) && isBootstrapOwnedOption(parts[0]))) {
+            // The exemption covers --name=value ONLY. Startup applies these options by
+            // matching the "name=" prefix, so the bare form is never applied -- and
+            // exempting it from the warning too would silently ignore it, recreating
+            // inside this very fix the defect the rejection registry exists to remove.
             FRLogger.warn("Unknown command line argument: " + p_args[i]);
           }
         } else if (p_args[i].startsWith("-de")) {
@@ -705,6 +879,12 @@ public class GlobalSettings implements Serializable {
             currentLocale = Locale.forLanguageTag("ro-RO");
           }
 
+        } else if (p_args[i].equalsIgnoreCase("-helpful") || p_args[i].equalsIgnoreCase("--helpful")) {
+          // Recognised here too. The flag is handled by the earlier parser, but this loop
+          // warns about anything it does not know -- so without this branch the app told the
+          // user their working flag was unknown. A refusal message about an argument that
+          // just worked is worse than no message; same family as defect 26.
+          show_helpful_option = true;
         } else if (p_args[i].startsWith("-dl")) {
           logging.file.enabled = false;
         } else if (p_args[i].startsWith("-da")) {

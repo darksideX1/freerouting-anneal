@@ -5,8 +5,23 @@ on: [ pull_request ]
 jobs:
   gradle:
     strategy:
+      # Let every platform report. The default cancels the siblings on first failure, which
+      # has twice left Windows reading "cancelled" -- not passing, not failing, just never
+      # allowed to finish. For an intermittent fault the per-platform spread within one run
+      # is the evidence we actually need (SOP-001 rule 8). Kept for when the matrix grows
+      # again.
+      fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-14, windows-latest ]
+        # Linux only on pull requests. GitHub bills macOS at 10x a Linux minute and Windows
+        # at 2x, so a documentation-only commit cost ~13 minutes of quota to learn what one
+        # Linux job already reported. Running the full matrix on every push exhausted the
+        # account, after which every check failed at scheduling with zero steps -- which
+        # looks exactly like broken code and is not.
+        #
+        # Platform coverage did not disappear, it moved: create-release.yml still builds on
+        # Windows and macOS, because the MSI and the DMG can only be produced there. Verify
+        # per-platform where a per-platform artifact is actually made.
+        os: [ ubuntu-latest ]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
@@ -27,8 +42,60 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x gradlew
 
+      # Diagnostics only -- the build's own exit status is passed through untouched, so
+      # this cannot turn a passing run red or a failing run green.
+      #
+      # McpEndpointsTest.toolsList_andToolsCall_bridgeToApiRoutes hangs here intermittently
+      # and has now cost five attempts at a root cause, every one of them wrong, for a
+      # single reason: the failure leaves NOTHING to read. The log stops mid-line, there is
+      # no assertion, and the runner tears the JVM down at cleanup. A JUnit @Timeout was
+      # added and does not fire, which already tells us the block is somewhere an interrupt
+      # cannot reach -- but not where.
+      #
+      # Dumps at 4, 6 and 8 minutes. They were at 10/13/16 and never fired once: the
+      # failing Windows step is torn down about nine minutes in, so a first dump at ten
+      # minutes was always aimed at a process that had already gone. Scheduling the
+      # instrument outside the only window it could observe is why several rounds of this
+      # investigation produced no evidence at all.
+      #
+      # This will also dump healthy builds, which is the right trade -- the output is
+      # diagnostic only, collapsed, and cannot change an exit status, while another run
+      # with no dump costs another round trip. Repeating gives a before/after pair: the
+      # same frame twice is a hang, different frames is slow progress.
       - name: Execute Gradle build
-        run: ./gradlew build
+        shell: bash
+        run: |
+          ./gradlew build &
+          GRADLE_PID=$!
+
+          (
+            for wait_s in 240 120 120; do
+              sleep $wait_s
+              kill -0 $GRADLE_PID 2>/dev/null || exit 0
+              echo "::group::thread dump after overrun"
+              echo "::warning::build still running -- dumping java threads"
+              # tr -d strips the carriage returns Windows jps emits. Without it $pid is
+              # "1680\r", jstack rejects it, and the dump fires but captures nothing --
+              # which is exactly what the first run to reach this code produced.
+              for pid in $(jps -q 2>/dev/null | tr -d '\r'); do
+                [ "$pid" = "$$" ] && continue
+                echo "===== jstack $pid ====="
+                jstack -l "$pid" 2>&1 || echo "(jstack failed on $pid)"
+              done
+              echo "::endgroup::"
+            done
+          ) &
+          WATCHDOG_PID=$!
+
+          # `|| BUILD_RC=$?` matters: this step runs under bash -e, where a bare failing
+          # `wait` ends the script on the spot -- so the kill and the explicit exit below
+          # never ran on a failing build, and the watchdog was left to be reaped as an
+          # orphan instead of being stopped. Found in review; it was the second reason no
+          # thread dump ever appeared, alongside the timings being outside the window.
+          BUILD_RC=0
+          wait $GRADLE_PID || BUILD_RC=$?
+          kill $WATCHDOG_PID 2>/dev/null || true
+          exit $BUILD_RC
 
   i18n-context-check:
     runs-on: ubuntu-latest

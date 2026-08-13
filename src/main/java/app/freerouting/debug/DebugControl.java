@@ -117,8 +117,24 @@ public class DebugControl {
      * @return true if the items should be processed/logged, false otherwise.
      */
     public boolean isInterested(String impactedItems) {
-        int netNo = getNetNo(impactedItems);
+        return isInterestedInNet(parseNetNo(impactedItems));
+    }
+
+    /**
+     * Interest test for an ALREADY-PARSED net number.
+     *
+     * <p>{@code isInterested(String)} and {@code check(String, String)} were each parsing
+     * the same {@code impactedItems} string with the same regex, and a granular trace calls
+     * both -- so every traced item paid for the parse twice. Callers that need both answers
+     * now parse once via {@link #parseNetNo(String)} and ask with the number.
+     */
+    public boolean isInterestedInNet(int netNo) {
         return Freerouting.globalSettings.debugSettings.isNetPermitted(netNo, null);
+    }
+
+    /** Extracts the net number from an impacted-items description; -1 when absent. */
+    public int parseNetNo(String impactedItems) {
+        return getNetNo(impactedItems);
     }
 
     /**
@@ -157,6 +173,23 @@ public class DebugControl {
      *
      * @param impactedItems Description of items involved (e.g. "Net #1, Trace...")
      */
+    /**
+     * Whether DebugControl would do anything if asked.
+     *
+     * <p>Exactly the condition {@link #check(String, String)} early-returns on, exposed so
+     * callers can skip building arguments for a call that will do nothing. Deliberately
+     * field reads only -- no parsing, no allocation -- because hot paths consult it per
+     * routed item.
+     */
+    public boolean isActive() {
+        if (Freerouting.globalSettings == null
+                || Freerouting.globalSettings.debugSettings == null) {
+            return false;
+        }
+        return Freerouting.globalSettings.debugSettings.singleStepExecution
+                || Freerouting.globalSettings.debugSettings.traceInsertionDelay != 0;
+    }
+
     public boolean check(String operation, String impactedItems) {
 
         if (Freerouting.globalSettings == null ||

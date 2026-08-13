@@ -156,13 +156,6 @@ public class BasicBoard implements Serializable {
     return p_item.net_count() > 0 ? Integer.toString(p_item.get_net_no(0)) : "none";
   }
 
-  private static String describe_bounds(IntBox p_bounds) {
-    if (p_bounds == null) {
-      return "null";
-    }
-    return "[(" + p_bounds.ll.x + "," + p_bounds.ll.y + ")..(" + p_bounds.ur.x + "," + p_bounds.ur.y + ")]";
-  }
-
   public int get_revision() {
     return revision;
   }
@@ -290,7 +283,9 @@ public class BasicBoard implements Serializable {
       // the connection may remain unrouted. This is non-critical — other segments will continue.
       FRLogger.warn("A trace segment could not be normalized and was skipped. "
           + "Affected net may have an unrouted connection. Cause: " + e.getMessage());
-      FRLogger.debug("BasicBoard.insert_trace_segment: normalization exception detail: " + e);
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("BasicBoard.insert_trace_segment: normalization exception detail: " + e);
+      }
     }
   }
 
@@ -540,11 +535,13 @@ public class BasicBoard implements Serializable {
       return;
     }
     if (is_item_activity_debug_candidate(p_item)) {
-      FRLogger.trace("ITEM_ACTIVITY action=REMOVE"
-          + ", id=" + p_item.get_id_no()
-          + ", type=" + p_item.getClass().getSimpleName()
-          + ", bounds=" + describe_bounds(p_item.bounding_box())
-          + ", net0=" + first_net_or_none(p_item));
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("ITEM_ACTIVITY action=REMOVE"
+            + ", id=" + p_item.get_id_no()
+            + ", type=" + p_item.getClass().getSimpleName()
+            + ", bounds=" + FRLogger.formatBounds(p_item.bounding_box())
+            + ", net0=" + first_net_or_none(p_item));
+      }
     }
     if (p_item instanceof Trace t && t.net_no_arr.length > 0 && t.net_no_arr[0] == 94) {
       if (t instanceof PolylineTrace pt && pt.corner_count() == 2
@@ -553,24 +550,24 @@ public class BasicBoard implements Serializable {
         FRLogger.trace(
             "BasicBoard.remove_item",
             "compare_trace_remove_item",
-            "REMOVE_ITEM called on trace [7,8]",
-            "Net #" + t.net_no_arr[0] + ",Trace #" + t.get_id_no() + ",Layer #" + t.get_layer(),
-            new Point[] { t.first_corner(), t.last_corner() });
+            () -> "REMOVE_ITEM called on trace [7,8]",
+            () -> "Net #" + t.net_no_arr[0] + ",Trace #" + t.get_id_no() + ",Layer #" + t.get_layer(),
+            () -> new Point[] { t.first_corner(), t.last_corner() });
         for (StackTraceElement ste : Thread.currentThread().getStackTrace()) {
           FRLogger.trace(
               "BasicBoard.remove_item",
               "compare_trace_remove_item_stack",
-              ste.toString(),
-              "Net #" + t.net_no_arr[0] + ",Trace #" + t.get_id_no() + ",Layer #" + t.get_layer(),
-              new Point[] { t.first_corner(), t.last_corner() });
+              () -> ste.toString(),
+              () -> "Net #" + t.net_no_arr[0] + ",Trace #" + t.get_id_no() + ",Layer #" + t.get_layer(),
+              () -> new Point[] { t.first_corner(), t.last_corner() });
         }
       } else {
         FRLogger.trace(
             "BasicBoard.remove_item",
             "compare_trace_remove_item",
-            "REMOVE_ITEM called by " + Thread.currentThread().getStackTrace()[3],
-            "Net #" + t.net_no_arr[0] + ",Trace #" + t.get_id_no() + ",Layer #" + t.get_layer(),
-            new Point[] { t.first_corner(), t.last_corner() });
+            () -> "REMOVE_ITEM called by " + Thread.currentThread().getStackTrace()[3],
+            () -> "Net #" + t.net_no_arr[0] + ",Trace #" + t.get_id_no() + ",Layer #" + t.get_layer(),
+            () -> new Point[] { t.first_corner(), t.last_corner() });
       }
     }
     if (p_item.isDeletionForbidden()) {
@@ -880,8 +877,10 @@ public class BasicBoard implements Serializable {
     if (normalizeSuppressedNetNos.contains(p_net_no)) {
       String netName = (rules != null && rules.nets != null && rules.nets.get(p_net_no) != null)
           ? rules.nets.get(p_net_no).name : String.valueOf(p_net_no);
-      FRLogger.debug("BasicBoard.normalize_traces: skipping net '" + netName
-          + "' because normalization already hit the oscillation cap on this board candidate.");
+      if (FRLogger.isDebugEnabled()) {
+        FRLogger.debug("BasicBoard.normalize_traces: skipping net '" + netName
+            + "' because normalization already hit the oscillation cap on this board candidate.");
+      }
       return false;
     }
     boolean result = false;
@@ -1378,8 +1377,10 @@ public class BasicBoard implements Serializable {
         }
       }
 
-      FRLogger.trace(String.format("BasicBoard.draw: Selected Layer: %s, Dominant Side: %s, Rendering Order: %s",
-          selectedLayerName, dominantSide, renderingOrderNames));
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace(String.format("BasicBoard.draw: Selected Layer: %s, Dominant Side: %s, Rendering Order: %s",
+            selectedLayerName, dominantSide, renderingOrderNames));
+      }
     }
 
     long drawStart = System.nanoTime();
@@ -1539,24 +1540,28 @@ public class BasicBoard implements Serializable {
 
     long drawEnd = System.nanoTime();
     if (FRLogger.getLogger().isDebugEnabled()) {
-      FRLogger.debug(String.format(
-          "BasicBoard.draw: total %.2f ms [collect=%.2f ms, group=%.2f ms, loop=%.2f ms (culled: %d), texts=%.2f ms] (items: %d)",
-          (drawEnd - drawStart) / 1_000_000.0,
-          (endCollect - startCollect) / 1_000_000.0,
-          (endGroup - startGroup) / 1_000_000.0,
-          (endLoop - startLoop) / 1_000_000.0,
-          culledCount,
-          (endText - startText) / 1_000_000.0,
-          allItems.size()
-      ));
-      FRLogger.debug(String.format(
-          "  - Item drawing times: Trace=%.2f ms (%d), Via=%.2f ms (%d), Pin=%.2f ms (%d), Plane=%.2f ms (%d), Other=%.2f ms (%d)",
-          timeTrace / 1_000_000.0, countTrace,
-          timeVia / 1_000_000.0, countVia,
-          timePin / 1_000_000.0, countPin,
-          timeConduction / 1_000_000.0, countConduction,
-          timeOther / 1_000_000.0, countOther
-      ));
+      {
+        FRLogger.debug(String.format(
+            "BasicBoard.draw: total %.2f ms [collect=%.2f ms, group=%.2f ms, loop=%.2f ms (culled: %d), texts=%.2f ms] (items: %d)",
+            (drawEnd - drawStart) / 1_000_000.0,
+            (endCollect - startCollect) / 1_000_000.0,
+            (endGroup - startGroup) / 1_000_000.0,
+            (endLoop - startLoop) / 1_000_000.0,
+            culledCount,
+            (endText - startText) / 1_000_000.0,
+            allItems.size()
+        ));
+      }
+      {
+        FRLogger.debug(String.format(
+            "  - Item drawing times: Trace=%.2f ms (%d), Via=%.2f ms (%d), Pin=%.2f ms (%d), Plane=%.2f ms (%d), Other=%.2f ms (%d)",
+            timeTrace / 1_000_000.0, countTrace,
+            timeVia / 1_000_000.0, countVia,
+            timePin / 1_000_000.0, countPin,
+            timeConduction / 1_000_000.0, countConduction,
+            timeOther / 1_000_000.0, countOther
+        ));
+      }
     }
   }
 
@@ -1717,11 +1722,13 @@ public class BasicBoard implements Serializable {
       return;
     }
     if (is_item_activity_debug_candidate(p_item)) {
-      FRLogger.trace("ITEM_ACTIVITY action=INSERT"
-          + ", id=" + p_item.get_id_no()
-          + ", type=" + p_item.getClass().getSimpleName()
-          + ", bounds=" + describe_bounds(p_item.bounding_box())
-          + ", net0=" + first_net_or_none(p_item));
+      if (FRLogger.isTraceEnabled()) {
+        FRLogger.trace("ITEM_ACTIVITY action=INSERT"
+            + ", id=" + p_item.get_id_no()
+            + ", type=" + p_item.getClass().getSimpleName()
+            + ", bounds=" + FRLogger.formatBounds(p_item.bounding_box())
+            + ", net0=" + first_net_or_none(p_item));
+      }
     }
 
     if (rules == null || rules.clearance_matrix == null || p_item.clearance_class_no() < 0

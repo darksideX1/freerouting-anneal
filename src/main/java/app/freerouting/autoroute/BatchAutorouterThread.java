@@ -346,8 +346,10 @@ public class BatchAutorouterThread extends StoppableThread {
       if (this.board.failureLog.shouldSkip(curr_item)) {
         Net net = board.rules.nets.get(curr_item.get_net_no(0));
         String netName = (net != null) ? net.name : "net#" + curr_item.get_net_no(0);
-        FRLogger.debug("Skipping " + curr_item.getClass().getSimpleName() + " on net '" + netName
-            + "' - exceeded failure threshold (" + board.failureLog.getFailureCount(curr_item) + " failures)");
+        if (FRLogger.isDebugEnabled()) {
+          FRLogger.debug("Skipping " + curr_item.getClass().getSimpleName() + " on net '" + netName
+              + "' - exceeded failure threshold (" + board.failureLog.getFailureCount(curr_item) + " failures)");
+        }
         --items_to_go_count;
         continue;
       }
@@ -388,13 +390,17 @@ public class BatchAutorouterThread extends StoppableThread {
           // Record the failure
           this.board.failureLog.recordFailure(curr_item, passNo, autorouterResult.state, autorouterResult.details);
 
-          FRLogger.debug("Autorouter " + autorouterResult.details);
+          if (FRLogger.isDebugEnabled()) {
+            FRLogger.debug("Autorouter " + autorouterResult.details);
+          }
           // Log details when we're down to last few items or item has many failures
           int failureCount = board.failureLog.getFailureCount(curr_item);
           if (items_to_go_count <= 5 || failureCount >= 3) {
-            FRLogger.debug("Pass #" + passNo + ": Failed to route " + curr_item.getClass().getSimpleName()
-                + " on net '" + netName + "' (" + items_to_go_count + " items remaining, "
-                + failureCount + " failures). State: " + autorouterResult.state);
+            if (FRLogger.isDebugEnabled()) {
+              FRLogger.debug("Pass #" + passNo + ": Failed to route " + curr_item.getClass().getSimpleName()
+                  + " on net '" + netName + "' (" + items_to_go_count + " items remaining, "
+                  + failureCount + " failures). State: " + autorouterResult.state);
+            }
           }
           ++not_routed;
           this.failedCount++;
@@ -525,18 +531,18 @@ public class BatchAutorouterThread extends StoppableThread {
 
   private void remove_tails(Item.StopConnectionOption p_stop_connection_option) {
     FRLogger.trace("BatchAutorouterThread.remove_tails", "starting_tail_removal",
-        FRLogger.buildTracePayload("autoroute", "cleanup", "start",
+        () -> FRLogger.buildTracePayload("autoroute", "cleanup", "start",
             "stop_option=" + p_stop_connection_option),
-        "",
-        null);
+        () -> "",
+        () -> null);
     board.start_marking_changed_area();
     boolean tails_removed = board.remove_trace_tails(-1, p_stop_connection_option);
     FRLogger.trace("BatchAutorouterThread.remove_tails", "tail_removal_complete",
-        FRLogger.buildTracePayload("autoroute", "cleanup", "complete",
+        () -> FRLogger.buildTracePayload("autoroute", "cleanup", "complete",
             "tails_removed=" + tails_removed
                 + " stop_option=" + p_stop_connection_option),
-        "",
-        null);
+        () -> "",
+        () -> null);
     board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, this.trace_cost_arr, this,
         TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
   }

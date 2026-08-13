@@ -284,13 +284,39 @@ signing {
 }
 
 // write constants to code
+// Which commit this jar was built from, and whether the tree was clean at the time.
+// Every cut of this fork self-reports the same v2.3.x-SNAPSHOT, so without this a jar
+// cannot say which jar it is -- three byte-different builds were cut in one day, all
+// claiming the same version. A build from a modified tree is marked -dirty because it
+// is NOT the commit it names and nobody can reproduce it from that sha.
+// Empty when git is unavailable (a source tarball), which leaves upstream's banner
+// exactly as it was.
+def sourceBuildId = {
+    try {
+        def sha = providers.exec {
+            commandLine 'git', 'rev-parse', '--short', 'HEAD'
+            ignoreExitValue = true
+        }.standardOutput.asText.get().trim()
+        if (sha.isEmpty()) return ''
+        def dirty = providers.exec {
+            commandLine 'git', 'status', '--porcelain'
+            ignoreExitValue = true
+        }.standardOutput.asText.get().trim()
+        return dirty.isEmpty() ? sha : (sha + '-dirty')
+    } catch (Throwable ignored) {
+        return ''
+    }
+}()
+
 tasks.register('writeVersionInfo') {
     def outputDir = layout.buildDirectory.dir("generated-src/app/freerouting/constants")
     def versionId = publishInfo.versionId
     def buildDateValue = buildDate
+    def sourceBuildValue = sourceBuildId
 
     inputs.property("versionId", versionId)
     inputs.property("buildDate", buildDateValue)
+    inputs.property("sourceBuild", sourceBuildValue)
     outputs.dir(outputDir)
 
     doLast {
@@ -302,6 +328,8 @@ tasks.register('writeVersionInfo') {
             public final class Constants {
               public static final String FREEROUTING_VERSION = \"${versionId}\";
               public static final String FREEROUTING_BUILD_DATE = \"${buildDateValue}\";
+              /** Commit this jar was built from, plus -dirty if the tree was modified. Empty without git. */
+              public static final String FREEROUTING_SOURCE_BUILD = \"${sourceBuildValue}\";
             }
             """.stripIndent().trim()
         )
@@ -357,6 +385,8 @@ tasks.register('writeVersionInfoV19') {
             public final class Constants {
               public static final String FREEROUTING_VERSION = \"${versionId}\";
               public static final String FREEROUTING_BUILD_DATE = \"${buildDateValue}\";
+              /** Commit this jar was built from, plus -dirty if the tree was modified. Empty without git. */
+              public static final String FREEROUTING_SOURCE_BUILD = \"${sourceBuildValue}\";
             }
             """.stripIndent().trim()
         )
@@ -412,6 +442,32 @@ tasks.register('dist', Copy) {
         rename 'freerouting-current-executable.jar', 'freerouting-executable.jar'
     }
     into 'build/dist/'
+}
+
+// Assembles the KiCad plugin, jar included, at build time.
+//
+// The jar used to be committed at integrations/KiCad/kicad-freerouting/plugins/jar/. That
+// cannot produce a trustworthy artifact: the file's presence in the tree makes the build
+// dirty, so the jar it contains reports itself as a build nobody can reproduce. A release
+// pipeline stages it; a repository should not carry it.
+//
+// The name here MUST match plugin.ini's `location`, because plugin.py reads that line and
+// launches whatever it names. ShippedVersionTest pins the two together.
+tasks.register('kicadPlugin', Zip) {
+    group = 'distribution'
+    description = 'Build the KiCad plugin zip with the current jar staged into it'
+    dependsOn executableJar
+
+    archiveFileName = "kicad-freerouting-${publishInfo.versionId}.zip"
+    destinationDirectory = layout.buildDirectory.dir('dist')
+
+    from('integrations/KiCad/kicad-freerouting') {
+        exclude 'plugins/jar/**'
+    }
+    from('build/libs/freerouting-current-executable.jar') {
+        into 'plugins/jar'
+        rename '.*', "${publishInfo.artifactId}-${publishInfo.versionId}.jar"
+    }
 }
 
 tasks.register('distV19', Copy) {

@@ -207,12 +207,11 @@ public abstract class InteractiveActionThread extends StoppableThread {
           FRLogger.warn("InteractiveActionThread: unable to save global settings");
         }
 
-        // Show the user settings dialog after auto-routing is finished if the number of
-        // completed jobs is greater than 5 and the user has not yet set their email
-        // address
-        if ((globalSettings.statistics.jobsCompleted >= 5) && globalSettings.userProfileSettings.userEmail.isEmpty()) {
-          boardManager.get_panel().board_frame.menubar.showProfileDialog();
-        }
+        // Deliberately does NOT open the user-settings/sponsorship dialog here.
+        // Finishing a routing job is not an invitation to ask for an email address:
+        // on an unattended or scripted run it is one more window waiting for a click,
+        // and on an interactive one it interrupts the moment the user wants to look at
+        // the result. The dialog remains available from the menu.
       }
     });
 

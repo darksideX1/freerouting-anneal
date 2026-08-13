@@ -70,11 +70,11 @@ public class NetIncompletes {
         String netLabel = "Net #" + p_net_no + (net != null ? " (" + net.name + ")" : "");
 
         FRLogger.trace("NetIncompletes.<init>", "start_calculation",
-            "Starting incomplete calculation: net=" + p_net_no
+            () -> "Starting incomplete calculation: net=" + p_net_no
                 + ", name=" + (net != null ? net.name : "null")
                 + ", total_items_in_collection=" + p_net_items.size(),
-            netLabel,
-            new Point[0]);
+            () -> netLabel,
+            () -> Point.EMPTY);
 
         // Filter out dangling items (vias and tracks with is_tail() == true)
         // AND items with zero contacts (unconnected pins/pads)
@@ -124,7 +124,7 @@ public class NetIncompletes {
                 + ", conduction_areas_total=" + conduction_area_count
                 + ", conduction_areas_kept=" + conduction_area_filtered_count,
             netLabel,
-            new Point[0]);
+            Point.EMPTY);
 
         // Create an array of Item-connected_set pairs.
         NetItem[] net_items = calculate_net_items(filtered_items);
@@ -136,18 +136,18 @@ public class NetIncompletes {
         this.connected_group_count = unique_connected_sets.size();
 
         FRLogger.trace("NetIncompletes.<init>", "connected_sets_calculated",
-            "Connected sets calculated: net_items_count=" + net_items.length
+            () -> "Connected sets calculated: net_items_count=" + net_items.length
                 + ", unique_connected_sets=" + unique_connected_sets.size()
                 + " (for N groups, expect N-1 airlines)",
-            netLabel,
-            new Point[0]);
+            () -> netLabel,
+            () -> Point.EMPTY);
 
         if (net_items.length <= 1) {
           this.connected_group_count = net_items.length;
           FRLogger.trace("NetIncompletes.<init>", "fully_connected",
-              "Net is fully connected or has no routable items: net_items=" + net_items.length,
-              netLabel,
-              new Point[0]);
+              () -> "Net is fully connected or has no routable items: net_items=" + net_items.length,
+              () -> netLabel,
+              () -> Point.EMPTY);
           return;
         }
 
@@ -182,14 +182,14 @@ public class NetIncompletes {
         }
 
         FRLogger.trace("NetIncompletes.<init>", "airlines_created",
-            "Airlines created: incomplete_count=" + this.incompletes.size()
+            () -> "Airlines created: incomplete_count=" + this.incompletes.size()
                 + ", total_items=" + p_net_items.size()
                 + ", filtered_items=" + filtered_items.size()
                 + ", net_items=" + net_items.length
                 + ", connected_groups=" + unique_connected_sets.size()
                 + " => Formula: total_items - incomplete_count = " + (p_net_items.size() - this.incompletes.size()),
-            netLabel,
-            new Point[0]);
+            () -> netLabel,
+            () -> Point.EMPTY);
 
         calc_length_violation();
     }

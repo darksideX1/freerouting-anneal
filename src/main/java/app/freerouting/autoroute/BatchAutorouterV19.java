@@ -36,7 +36,7 @@ import java.util.TreeSet;
  * - Different item routing order (natural order vs sorted)
  * - No failure tracking or skip logic
  */
-public class BatchAutorouterV19 extends NamedAlgorithm {
+public class BatchAutorouterV19 extends NamedAlgorithm implements BatchRoutingAlgorithm {
 
     private static final int TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP = 1000;
 
@@ -133,6 +133,30 @@ public class BatchAutorouterV19 extends NamedAlgorithm {
      * Returns the initial number of unrouted nets at the start of the routing
      * session.
      */
+
+    /**
+     * The v1.9 router has no fanout stage, so it can never time out in one.
+     */
+    /**
+     * Set when a pass ended on an exception rather than on having nothing left to do.
+     *
+     * <p>Previously this engine had no per-pass outcome to inspect and reported false
+     * unconditionally, so the scheduler's protection against overwriting a good board with
+     * a partially routed one could never fire for v1.9 -- the engine most likely to be
+     * running when someone is comparing output.
+     */
+    private volatile boolean passEndedAbnormally = false;
+
+    @Override
+    public boolean endedAbnormally() {
+        return passEndedAbnormally;
+    }
+
+    @Override
+    public boolean isFanoutTimedOut() {
+        return false;
+    }
+
     public int getInitialUnroutedCount() {
         return this.initialUnroutedCount;
     }
@@ -197,7 +221,13 @@ public class BatchAutorouterV19 extends NamedAlgorithm {
                     "BatchAutorouterV19.autoroute_pass #" + currentPass + " on board '" + current_board_hash + "'");
 
             // Run one pass using v1.9 logic
-            continueAutorouting = autoroute_pass(currentPass, true);
+            PassOutcome passOutcome = autoroute_pass(currentPass, true);
+            continueAutorouting = passOutcome.shouldContinue();
+            if (passOutcome.isAbnormal()) {
+                // ABORTED and NO_PROGRESS agree on stopping and differ on why, which is
+                // exactly the distinction the boolean could not carry.
+                this.passEndedAbnormally = true;
+            }
 
             double autorouter_pass_duration = FRLogger
                     .traceExit("BatchAutorouterV19.autoroute_pass #" + currentPass + " on board '" + current_board_hash
@@ -261,7 +291,7 @@ public class BatchAutorouterV19 extends NamedAlgorithm {
      * - Natural item order (no sorting by airline distance)
      * - Simpler progress tracking
      */
-    private boolean autoroute_pass(int p_pass_no, boolean p_with_screen_message) {
+    private PassOutcome autoroute_pass(int p_pass_no, boolean p_with_screen_message) {
         try {
             Collection<Item> autoroute_item_list = new LinkedList<>();
             Set<Item> handled_items = new TreeSet<>();
@@ -302,7 +332,7 @@ public class BatchAutorouterV19 extends NamedAlgorithm {
             // If there are no items to route, we're done
             if (autoroute_item_list.isEmpty()) {
                 this.air_line = null;
-                return false;
+                return PassOutcome.NO_PROGRESS;
             }
 
             int items_to_go_count = autoroute_item_list.size();
@@ -354,11 +384,11 @@ public class BatchAutorouterV19 extends NamedAlgorithm {
             job.logDebug("V1.9 Pass #" + p_pass_no + " completed: routed=" + routed + ", not_found=" + not_found
                     + ", ripped=" + ripped_item_count);
 
-            return true;
+            return PassOutcome.PROGRESS;
         } catch (Exception e) {
             job.logError("Something went wrong during the V1.9 auto-routing", e);
             this.air_line = null;
-            return false;
+            return PassOutcome.ABORTED;
         }
     }
 
@@ -457,7 +487,14 @@ public class BatchAutorouterV19 extends NamedAlgorithm {
             return autoroute_result.state == AutorouteAttemptState.ROUTED
                     || autoroute_result.state == AutorouteAttemptState.ALREADY_CONNECTED;
         } catch (Exception e) {
-            return false;
+            // Rethrow, for the same reason as the v2 path: items may already have been
+            // ripped or inserted, so reporting this as an ordinary route miss lets the
+            // pass claim PROGRESS and the scheduler persist a half-mutated board.
+            // autoroute_pass maps the propagated exception to PassOutcome.ABORTED.
+            job.logError("V1.9 auto-routing of item " + p_item + " (net " + p_route_net_no
+                    + ") failed with an exception; aborting the pass, because the board may"
+                    + " be partially mutated and must not be presented as a result.", e);
+            throw new RuntimeException("V1.9 auto-routing of an item failed", e);
         }
     }
 
